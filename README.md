@@ -4,7 +4,7 @@ Bot de trading com IA para MetaTrader 5, com pipeline de dados, treino LightGBM,
 
 ## Resumo rapido
 
-- Coleta candles do MT5 por simbolo/timeframe.
+- Coleta candles com fonte hibrida (`auto`: MT5 -> Yahoo fallback).
 - Gera features tecnicas e labels (triple barrier).
 - Treina LightGBM com validacao temporal (PurgedKFold).
 - Roda fases de robustez (`phase4` ate `phase11`).
@@ -78,8 +78,18 @@ setx MT5_PATH "C:\Program Files\MetaTrader 5\terminal64.exe"
 ### 1) Coletar dados
 
 ```powershell
-python -m src.data_feed --symbol EURUSD --tfs M5 M15 M30 H1 H4 --months 24
+python -m src.data_feed --symbol EURUSD --tfs M5 M15 M30 H1 H4 --months 24 --source auto
 ```
+
+Fontes suportadas:
+
+- `--source auto` (padrao): tenta MT5 primeiro; se vier 0 candles, tenta Yahoo.
+- `--source mt5`: usa somente MT5.
+- `--source yahoo`: usa somente Yahoo.
+
+Observacao:
+
+- A coleta MT5 agora usa janela em blocos (backfill por periodos), sem depender de scroll manual de grafico.
 
 ### 2) Gerar dataset
 
@@ -148,11 +158,16 @@ Opcoes atuais:
 
 - Se dataset nao existir no treino:
   - pergunta se deve gerar automaticamente
+  - pergunta a fonte (`auto/mt5/yahoo`)
   - roda coleta (`data_feed`) + build (`build_dataset`) + treino
 - Se dataset/features estiverem vazios:
   - aborta com mensagem clara (sem traceback confuso)
+- Se detectar inconsistencia (raw/features/dataset vazio ou quebrado):
+  - oferece apagar artefatos do simbolo/TF e reconstruir
 - Cria `run_id` e salva logs/outputs em `reports/runs/{run_id}`
 - Salva ultima selecao em `reports/runs/last_selection.json`
+- Aceita entrada em minusculo para simbolo/TF e normaliza automaticamente
+- Exibe "Ultima selecao" de forma amigavel (painel com acao/par/tf/run_id)
 
 ## Simbolo por lista (MT5)
 
@@ -285,7 +300,7 @@ Principais grupos:
 Gere automaticamente pelo menu (opcao 2), ou rode manualmente:
 
 ```powershell
-python -m src.data_feed --symbol XAUUSD --tfs M5 --months 24
+python -m src.data_feed --symbol XAUUSD --tfs M5 --months 24 --source auto
 python -m src.build_dataset --symbol XAUUSD --tf M5
 ```
 
@@ -295,8 +310,19 @@ Normalmente significa:
 
 - simbolo inexistente no broker (ex: usar `XAUUSDm` em vez de `XAUUSD`)
 - historico insuficiente no MT5
+- fallback externo sem historico suficiente para esse ativo/intervalo
 
 Use a selecao por lista no menu para achar o nome real do ativo.
+
+### "Os dados Yahoo sao iguais ao MT5?"
+
+Nao. Yahoo e fonte de mercado para pesquisa/backtest rapido, mas nao replica exatamente:
+
+- spread/custos do seu broker
+- microvariacao de candles do servidor MT5
+- condicoes exatas de execucao
+
+Use `MT5` para validacao final de operacao. Use `auto` para acelerar preparacao de dataset.
 
 ## Aviso de risco
 

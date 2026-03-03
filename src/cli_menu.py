@@ -45,6 +45,16 @@ LAST_SELECTION = RUNS_DIR / "last_selection.json"
 SYMBOL_PROFILES = RUNS_DIR / "symbol_profiles.json"
 MT5_CREDS_FILE = RUNS_DIR / "mt5_credentials.json"
 _CONSOLE = Console() if Console else None
+_ACTION_LABELS = {
+    "train": "Treino concluido",
+    "train_empty_dataset": "Treino abortado (dataset vazio)",
+    "train_prepare_empty_raw": "Preparacao falhou (sem candles)",
+    "train_prepare_empty_features": "Preparacao falhou (features vazias)",
+    "train_prepare_fail": "Preparacao falhou",
+    "train_inconsistent_cancel": "Treino cancelado (inconsistencia)",
+    "bot": "Execucao do bot",
+    "trade_live": "Trade iniciado (background)",
+}
 
 
 def _print(msg: str, style: str | None = None) -> None:
@@ -157,12 +167,12 @@ def _available_symbols() -> list[str]:
 def _choose_symbol(default: str = "EURUSD") -> str:
     names = _available_symbols()
     if not names:
-        return _ask("Simbolo", default).upper()
-    filt = _ask("Filtro de simbolo (ENTER=todos)", default[:3]).upper()
+        return _ask("Simbolo", default, to_upper=True)
+    filt = _ask("Filtro de simbolo (ENTER=todos)", default[:3], to_upper=True)
     filtered = [n for n in names if filt in n] if filt else names
     if not filtered:
         _print(f"Nenhum simbolo com filtro '{filt}'. Usando digitacao manual.", style="yellow")
-        return _ask("Simbolo", default).upper()
+        return _ask("Simbolo", default, to_upper=True)
     max_show = 80
     show = filtered[:max_show]
     if Table is not None and _CONSOLE is not None:
@@ -184,26 +194,49 @@ def _choose_symbol(default: str = "EURUSD") -> str:
     except ValueError:
         idx = 0
     if idx <= 0:
-        return _ask("Simbolo", default).upper()
+        return _ask("Simbolo", default, to_upper=True)
     if 1 <= idx <= len(show):
         return show[idx - 1].upper()
     _print("Indice invalido, usando valor padrao.", style="yellow")
     return default.upper()
 
 
-def _ask(prompt: str, default: str | None = None) -> str:
+def _ask(prompt: str, default: str | None = None, to_upper: bool = False) -> str:
     msg = f"{prompt}"
     if default is not None:
         msg += f" [{default}]"
     msg += ": "
     raw = input(msg).strip()
-    return raw if raw else (default or "")
+    val = raw if raw else (default or "")
+    return val.upper() if to_upper else val
 
 
 def _ask_yes_no(prompt: str, default: bool = False) -> bool:
     d = "s" if default else "n"
     raw = _ask(f"{prompt} (s/n)", d).strip().lower()
     return raw in {"s", "sim", "y", "yes", "1", "true"}
+
+
+def _print_last_selection(last: dict[str, Any]) -> None:
+    if not last:
+        return
+    action = str(last.get("action", "")).strip()
+    action_label = _ACTION_LABELS.get(action, action or "-")
+    symbol = str(last.get("symbol", "-"))
+    tf = str(last.get("tf", "-"))
+    phase = str(last.get("phase", "")).strip()
+    run_id = str(last.get("run_id", "-"))
+    extra = f" | Fase: {phase}" if phase else ""
+    if _CONSOLE is not None and Panel is not None:
+        body = (
+            f"[white]Acao:[/white] [bold]{action_label}[/bold]\n"
+            f"[white]Par:[/white] [cyan]{symbol}[/cyan]  "
+            f"[white]TF:[/white] [cyan]{tf}[/cyan]{extra}\n"
+            f"[white]Run ID:[/white] [magenta]{run_id}[/magenta]"
+        )
+        _CONSOLE.print(Panel(body, title="Ultima Selecao", border_style="magenta"))
+    else:
+        _print(f"Ultima selecao | Acao: {action_label} | Par: {symbol} | TF: {tf}{extra} | Run ID: {run_id}", style="magenta")
 
 
 def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
@@ -338,7 +371,7 @@ def _print_models() -> None:
 
 def _action_train() -> None:
     symbol = _choose_symbol("EURUSD")
-    tf = _ask("Timeframe", "M5").upper()
+    tf = _ask("Timeframe", "M5", to_upper=True)
     splits = _ask("Splits PurgedKFold", "5")
     seed = _ask("Seed", "42")
     if not _validate_symbol(symbol):
@@ -346,15 +379,54 @@ def _action_train() -> None:
         return
     run_id = _run_id(symbol, tf, "train")
     run_dir = RUNS_DIR / run_id
+    raw_path = CONFIG.data_raw_dir / f"{symbol}_{tf}.parquet"
+    feat_path = CONFIG.data_processed_dir / f"{symbol}_{tf}_features.parquet"
     dataset_path = CONFIG.data_processed_dir / f"{symbol}_{tf}_dataset.parquet"
+
+    def _rows_or_none(path: Path) -> int | None:
+        if not path.exists():
+            return None
+        try:
+            return int(len(pd.read_parquet(path)))
+        except Exception:
+            return None
+
+    raw_rows = _rows_or_none(raw_path)
+    feat_rows = _rows_or_none(feat_path)
+    ds_rows = _rows_or_none(dataset_path)
+    inconsistent = (
+        (dataset_path.exists() and (ds_rows is None or ds_rows == 0))
+        or (feat_path.exists() and (feat_rows is None or feat_rows == 0))
+        or (raw_path.exists() and (raw_rows is None or raw_rows == 0))
+        or (dataset_path.exists() and not feat_path.exists())
+    )
+
+    if inconsistent:
+        _print("Detectada inconsistência nos artefatos (raw/features/dataset vazio ou inválido).", style="yellow")
+        if _ask_yes_no("Deseja apagar artefatos do símbolo/TF e reconstruir?", default=True):
+            for p in (dataset_path, feat_path, raw_path):
+                if p.exists():
+                    try:
+                        p.unlink()
+                        _print(f"Removido: {p}", style="cyan")
+                    except Exception as exc:
+                        _print(f"Falha ao remover {p}: {exc}", style="red")
+        else:
+            _print("Treino cancelado por inconsistência.", style="yellow")
+            _save_last_selection({"symbol": symbol, "tf": tf, "action": "train_inconsistent_cancel", "run_id": run_id})
+            return
+
     if not dataset_path.exists():
         _print(f"Dataset nao encontrado: {dataset_path}", style="yellow")
         if _ask_yes_no("Deseja gerar dataset automaticamente agora?", default=True):
             months = _ask("Meses de historico para coleta", "24")
-            _print("Passo 1/2: coletando dados do MT5...", style="cyan")
+            source = _ask("Fonte de dados (auto/mt5/yahoo)", "auto").strip().lower()
+            if source not in {"auto", "mt5", "yahoo"}:
+                source = "auto"
+            _print(f"Passo 1/2: coletando dados ({source})...", style="cyan")
             meta_feed = _run_module(
                 module="mt5_ai_bot.src.data_feed",
-                args=["--symbol", symbol, "--tfs", tf, "--months", months],
+                args=["--symbol", symbol, "--tfs", tf, "--months", months, "--source", source],
                 run_dir=run_dir,
             )
             if meta_feed["return_code"] != 0:
@@ -371,8 +443,6 @@ def _action_train() -> None:
                 _print("Falha ao gerar dataset. Veja stderr em run_meta/logs.", style="red")
                 _save_last_selection({"symbol": symbol, "tf": tf, "action": "train_prepare_fail", "run_id": run_id})
                 return
-            raw_path = CONFIG.data_raw_dir / f"{symbol}_{tf}.parquet"
-            feat_path = CONFIG.data_processed_dir / f"{symbol}_{tf}_features.parquet"
             if raw_path.exists():
                 raw_rows = len(pd.read_parquet(raw_path))
                 if raw_rows == 0:
@@ -417,8 +487,8 @@ def _action_train() -> None:
 def _action_phase() -> None:
     symbol = _choose_symbol("EURUSD")
     phase = _ask("Fase (4-11)", "11")
-    tf = _ask("TF entrada/perfil", "M5").upper()
-    gate = _ask("TF gate", "M30").upper()
+    tf = _ask("TF entrada/perfil", "M5", to_upper=True)
+    gate = _ask("TF gate", "M30", to_upper=True)
     windows = _ask("Janelas walk-forward", "8")
     seed = _ask("Seed", "42")
     if phase not in {"4", "5", "6", "7", "8", "9", "10", "11"}:
@@ -451,9 +521,9 @@ def _build_bot_args_submenu(
     force_trade: bool = False,
 ) -> tuple[str, str, list[str]]:
     symbol = _choose_symbol("EURUSD")
-    tf = _ask("TF entrada", "M5").upper()
+    tf = _ask("TF entrada", "M5", to_upper=True)
     model_symbol = _choose_symbol(symbol)
-    model_tf = _ask("Model tf", tf).upper()
+    model_tf = _ask("Model tf", tf, to_upper=True)
     model_version = _ask("Model version (vazio=latest)", "")
     once = _ask_yes_no("Rodar apenas um ciclo (--once)", default=False)
     no_trade = _ask_yes_no("Modo sem ordem (--no-trade)", default=False)
@@ -515,8 +585,8 @@ def _action_profiles() -> None:
     data = _load_json(SYMBOL_PROFILES, {"profiles": []})
     _print("Configurar simbolo/tf preferido (nao altera estrategia, apenas orquestracao).", style="cyan")
     symbol = _choose_symbol("EURUSD")
-    tf = _ask("TF", "M5").upper()
-    gate = _ask("Gate", "M30").upper()
+    tf = _ask("TF", "M5", to_upper=True)
+    gate = _ask("Gate", "M30", to_upper=True)
     item = {"symbol": symbol, "tf": tf, "gate": gate, "updated_at": _now_utc().isoformat()}
     profiles = [p for p in data.get("profiles", []) if not (p.get("symbol") == symbol and p.get("tf") == tf)]
     profiles.append(item)
@@ -593,7 +663,7 @@ def _positions_table(symbol_filter: str | None = None) -> tuple[Any, int, float]
 
 
 def _action_active_trades() -> None:
-    symbol = _ask("Filtrar simbolo (ENTER=todos)", "").upper()
+    symbol = _ask("Filtrar simbolo (ENTER=todos)", "", to_upper=True)
     symbol_filter = symbol if symbol else None
     duration_s = int(_ask("Duracao de monitoramento (segundos)", "60"))
     refresh_s = float(_ask("Intervalo de refresh (segundos)", "2"))
@@ -654,8 +724,7 @@ def run_menu() -> None:
                 f"MT5_instalado={'SIM' if st['installed'] else 'NAO'} | "
                 f"Login={'LOGADO' if st['logged_in'] else 'NAO LOGADO'}"
             )
-        if last:
-            _print(f"Ultima selecao: {last}", style="magenta")
+        _print_last_selection(last)
         _print("1) Listar modelos treinados", style="white")
         _print("2) Treinar novo modelo", style="white")
         _print("3) Rodar backtest/robustez (fase)", style="white")
