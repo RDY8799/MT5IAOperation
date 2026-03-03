@@ -86,6 +86,58 @@ class LiveConfig(BaseModel):
     min_confidence_alert: float = 0.55
 
 
+class TimeframeConfig(BaseModel):
+    # Timeframe de entrada (onde as ordens sao decididas/executadas).
+    tf_entry: str
+    # Timeframe de gate/direcao.
+    tf_gate: str
+    # Horizonte em candles do tf_entry (uso em validacao/controles).
+    horizon_candles: int
+    # Maximo de entradas por hora/janela configurada.
+    max_trades_per_hour: int
+    # Modo da janela de contagem de trades: rolling 60m ou hora fixa.
+    trades_window_mode: str = "rolling_60m"
+    # Minimo de candles entre trades da mesma direcao.
+    min_candles_between_same_direction_trades: int = 0
+    # Bloqueio de reentrada apos fechamento (mesma direcao).
+    reentry_block_candles: int = 2
+    # Modo do threshold minimo de volatilidade.
+    volatility_threshold_min_mode: str = "atr_percentile"
+    # Modo do threshold maximo de volatilidade.
+    volatility_threshold_max_mode: str = "atr_percentile"
+    # Percentil minimo de ATR para liberar operacao.
+    volatility_p_min: float = 40.0
+    # Percentil maximo de ATR para liberar operacao.
+    volatility_p_max: float = 95.0
+    # Threshold absoluto minimo de ATR (quando modo=absolute).
+    volatility_abs_min: float = 0.0
+    # Threshold absoluto maximo de ATR (quando modo=absolute).
+    volatility_abs_max: float = 1e9
+    # Risco por trade deste perfil (em % do saldo).
+    risk_pct: float = 0.5
+    # Threshold minimo de probabilidade para entrada.
+    signal_threshold: float = 0.50
+    # Diferenca minima entre p_buy e p_sell para evitar sinais ruidosos.
+    min_signal_margin: float = 0.0
+    # Habilita/desabilita o perfil.
+    enabled: bool = True
+
+
+class GlobalRiskConfig(BaseModel):
+    # Limite de risco total agregado por simbolo (em % do saldo).
+    max_total_risk_pct_symbol: float = 2.0
+    # Maximo de posicoes abertas por simbolo (global entre TFs).
+    max_total_open_positions_symbol: int = 3
+    # Perda diaria maxima por simbolo (em % do saldo).
+    max_total_daily_loss_symbol: float = 5.0
+    # Exposicao maxima em lotes por simbolo.
+    max_total_exposure_lots_symbol: float = 10.0
+    # Maximo de novas ordens por janela de rate limit.
+    max_new_orders_per_minute_symbol: int = 1
+    # Tamanho da janela de rate limit.
+    order_rate_window_seconds: int = 60
+
+
 class FeatureConfig(BaseModel):
     # Janela do ATR.
     atr_window: int = 14
@@ -113,8 +165,60 @@ class AppConfig(BaseModel):
     # Fuso horario padrao do app.
     timezone: str = "UTC"
     risk: RiskConfig = RiskConfig()
+    global_risk: GlobalRiskConfig = GlobalRiskConfig()
     triple_barrier: TripleBarrierConfig = TripleBarrierConfig()
     live: LiveConfig = LiveConfig()
+    timeframe_profiles: Dict[str, TimeframeConfig] = Field(
+        default_factory=lambda: {
+            "M5": TimeframeConfig(
+                tf_entry="M5",
+                tf_gate="M30",
+                horizon_candles=12,
+                max_trades_per_hour=1,
+                trades_window_mode="rolling_60m",
+                min_candles_between_same_direction_trades=5,
+                reentry_block_candles=3,
+                volatility_threshold_min_mode="atr_percentile",
+                volatility_threshold_max_mode="atr_percentile",
+                volatility_p_min=50.0,
+                volatility_p_max=90.0,
+                risk_pct=0.5,
+                signal_threshold=0.55,
+                min_signal_margin=0.15,
+                enabled=True,
+            ),
+            "M30": TimeframeConfig(
+                tf_entry="M30",
+                tf_gate="H4",
+                horizon_candles=6,
+                max_trades_per_hour=2,
+                trades_window_mode="fixed_hour",
+                min_candles_between_same_direction_trades=2,
+                reentry_block_candles=2,
+                volatility_threshold_min_mode="atr_percentile",
+                volatility_threshold_max_mode="atr_percentile",
+                volatility_p_min=35.0,
+                volatility_p_max=97.0,
+                risk_pct=0.75,
+                enabled=False,
+            ),
+            "M1": TimeframeConfig(
+                tf_entry="M1",
+                tf_gate="M15",
+                horizon_candles=30,
+                max_trades_per_hour=3,
+                trades_window_mode="rolling_60m",
+                min_candles_between_same_direction_trades=5,
+                reentry_block_candles=3,
+                volatility_threshold_min_mode="atr_percentile",
+                volatility_threshold_max_mode="atr_percentile",
+                volatility_p_min=40.0,
+                volatility_p_max=98.0,
+                risk_pct=0.25,
+                enabled=False,
+            ),
+        }
+    )
     feature: FeatureConfig = FeatureConfig()
     fracdiff_threshold: float = 1e-5
 

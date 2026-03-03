@@ -29,7 +29,7 @@ def _class_map(y: pd.Series) -> tuple[np.ndarray, dict[int, int], dict[int, int]
     return y_idx, to_idx, from_idx
 
 
-def train(symbol: str, timeframe: str, n_splits: int = 5) -> tuple[str, str]:
+def train(symbol: str, timeframe: str, n_splits: int = 5, seed: int = 42) -> tuple[str, str]:
     if lgb is None:
         raise RuntimeError("lightgbm not installed")
     dataset_path = CONFIG.data_processed_dir / f"{symbol}_{timeframe}_dataset.parquet"
@@ -65,7 +65,7 @@ def train(symbol: str, timeframe: str, n_splits: int = 5) -> tuple[str, str]:
             learning_rate=0.03,
             subsample=0.9,
             colsample_bytree=0.9,
-            random_state=42,
+            random_state=seed,
             class_weight=class_weights,
         )
         model.fit(
@@ -97,6 +97,19 @@ def train(symbol: str, timeframe: str, n_splits: int = 5) -> tuple[str, str]:
         "features": feature_cols,
         "metrics": metrics,
         "class_labels": class_labels,
+        "seed": seed,
+        "params": {
+            "n_splits": n_splits,
+            "n_estimators": 1200,
+            "learning_rate": 0.03,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+        },
+        "dataset_range": {
+            "start": str(pd.Timestamp(df["time"].min())),
+            "end": str(pd.Timestamp(df["time"].max())),
+            "rows": int(len(df)),
+        },
     }
     model_path, meta_path = save_model_bundle(last_model, metadata, symbol, timeframe)
     print(json.dumps(metrics, indent=2))
@@ -108,12 +121,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--tf", required=True)
     parser.add_argument("--splits", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    model_path, meta_path = train(symbol=args.symbol, timeframe=args.tf, n_splits=args.splits)
+    model_path, meta_path = train(symbol=args.symbol, timeframe=args.tf, n_splits=args.splits, seed=args.seed)
     print(f"model={model_path}")
     print(f"meta={meta_path}")
 

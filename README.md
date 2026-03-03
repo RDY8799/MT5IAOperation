@@ -1,43 +1,54 @@
-# MT5IAOperation - Bot de Trading com IA para MetaTrader 5
+﻿# MT5 AI Bot (MT5IAOperation)
 
-Projeto de bot para operacao automatizada (foco em conta DEMO) com:
-- pipeline de dados e features
-- treino de modelo LightGBM
-- backtest com custos realistas
-- validacao walk-forward/robustez por fases
-- execucao live com regras de risco
-- logs tecnicos (JSON) e logs humanos (PT-BR)
-- alertas no Telegram
+Bot de trading com IA para MetaTrader 5, com pipeline de dados, treino LightGBM, backtests por fases, execucao live, camada de risco e menu CLI interativo.
 
-## 1) Estrutura principal
+## Resumo rapido
 
-- `src/data_feed.py`: coleta candles do MT5 e salva em `data/raw`.
-- `src/features.py`: gera features tecnicas e de contexto (inclui suporte/resistencia).
-- `src/labeling_triple_barrier.py`: gera labels pelo metodo triple barrier.
-- `src/build_dataset.py`: monta dataset final para treino/backtest.
-- `src/train_lgbm.py`: treino LightGBM com PurgedKFold.
-- `src/backtest_engine.py`: motor de backtest e metricas.
-- `src/multitf.py`: alinhamento H4->H1 e politicas multi-timeframe.
-- `src/phase4_runner.py ... src/phase9_runner.py`: fases de diagnostico/robustez.
-- `src/bot_live.py`: execucao live/paper no MT5.
-- `src/config.py`: configuracoes centrais.
-- `src/notifier_telegram.py`: notificacoes Telegram.
+- Coleta candles do MT5 por simbolo/timeframe.
+- Gera features tecnicas e labels (triple barrier).
+- Treina LightGBM com validacao temporal (PurgedKFold).
+- Roda fases de robustez (`phase4` ate `phase11`).
+- Executa bot live/paper/diagnostico.
+- Registra modelos em `Model Registry` com versao, schema e metadados.
+- Orquestra tudo por menu (`cli_menu`) com selecao de simbolo por lista do MT5.
 
-Pastas:
-- `data/raw`, `data/processed`
-- `models`
-- `logs`
-- `reports`
+## Estrutura
 
-## 2) Requisitos
+```
+mt5_ai_bot/
+  data/
+    raw/
+    processed/
+  logs/
+  models/                      # legado (compatibilidade)
+  reports/
+    models/
+      index.json
+      {symbol}/{tf}/{version}/
+        model.bin
+        features_schema.json
+        train_meta.json
+        metrics_oof.json
+    runs/
+      {run_id}/
+        run_meta.json
+        logs/
+          stdout.log
+          stderr.log
+        outputs/
+  src/
+  tests/
+```
 
-- Windows com MetaTrader 5 instalado
+## Requisitos
+
+- Windows + MetaTrader 5 instalado
 - Python 3.11+
-- Conta MT5 (preferencialmente DEMO para validacao)
+- Conta demo (recomendado para validacao)
 
-## 3) Instalacao
+## Instalacao
 
-No diretorio raiz `mt5_ai_bot`:
+No diretorio `mt5_ai_bot`:
 
 ```powershell
 python -m venv .venv
@@ -45,9 +56,11 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 4) Variaveis de ambiente MT5
+## Credenciais MT5
 
-Opcionalmente configure para login automatico:
+Voce pode configurar credenciais de 2 formas:
+
+1. Variaveis de ambiente do Windows:
 
 ```powershell
 setx MT5_LOGIN "SEU_LOGIN"
@@ -56,88 +69,176 @@ setx MT5_SERVER "SEU_SERVIDOR"
 setx MT5_PATH "C:\Program Files\MetaTrader 5\terminal64.exe"
 ```
 
-## 5) Pipeline de treino (exemplo)
+2. Pelo menu (`opcao 9`), salvando em:
 
-### 5.1 Coletar dados
+- `reports/runs/mt5_credentials.json`
 
-```powershell
-python -m src.data_feed --symbol EURUSD --tfs M1 M5 M15 M30 H1 H4 --months 24
-```
+## Pipeline de treino (manual)
 
-### 5.2 Gerar dataset
+### 1) Coletar dados
 
 ```powershell
-python -m src.build_dataset --symbol EURUSD --tf M15
-python -m src.build_dataset --symbol EURUSD --tf H1
+python -m src.data_feed --symbol EURUSD --tfs M5 M15 M30 H1 H4 --months 24
 ```
 
-### 5.3 Treinar modelo
+### 2) Gerar dataset
 
 ```powershell
-python -m src.train_lgbm --symbol EURUSD --tf M15 --splits 5
-python -m src.train_lgbm --symbol EURUSD --tf H1 --splits 5
+python -m src.build_dataset --symbol EURUSD --tf M5
 ```
 
-## 6) Backtest e fases
+### 3) Treinar modelo
+
+```powershell
+python -m src.train_lgbm --symbol EURUSD --tf M5 --splits 5 --seed 42
+```
+
+## Model Registry
+
+Arquivo principal:
+
+- `reports/models/index.json`
+
+Cada modelo registrado contem:
+
+- `symbol`, `timeframe`, `version`, `trained_at`
+- `model_path`
+- `features_schema_path`
+- `train_meta_path`
+- `metrics_oof_path`
+- resumo de metricas
+
+API principal (modulo `src/model_registry.py`):
+
+- `list_models()`
+- `get_latest_model(symbol, tf)`
+- `get_model(symbol, tf, version)`
+- `register_model(...)`
+- `load_model_object(...)`
+
+## Menu interativo (CLI)
+
+Executar:
+
+```powershell
+python -m src.cli_menu
+```
+
+O topo do menu mostra status de:
+
+- Credenciais salvas
+- MT5 instalado
+- Login ativo no MT5
+
+Opcoes atuais:
+
+1. Listar modelos treinados
+2. Treinar novo modelo
+3. Rodar backtest/robustez (fase)
+4. Rodar bot (paper)
+5. Rodar bot (demo-trade)
+6. Rodar diagnostico (diagnostic-only)
+7. Configurar simbolos/TFs (perfis)
+8. Iniciar trade (background + submenu flags)
+9. Configurar credenciais MT5
+10. Trades ativos (tempo real)
+0. Sair
+
+### O que o menu ja automatiza
+
+- Se dataset nao existir no treino:
+  - pergunta se deve gerar automaticamente
+  - roda coleta (`data_feed`) + build (`build_dataset`) + treino
+- Se dataset/features estiverem vazios:
+  - aborta com mensagem clara (sem traceback confuso)
+- Cria `run_id` e salva logs/outputs em `reports/runs/{run_id}`
+- Salva ultima selecao em `reports/runs/last_selection.json`
+
+## Simbolo por lista (MT5)
+
+No menu, quando pede simbolo:
+
+- carrega lista de simbolos do MT5
+- permite filtro (ex: `EUR`, `XAU`)
+- selecao por indice numerico
+
+## Rodar bot live/paper/diagnostico
+
+### Live
+
+```powershell
+python -m src.bot_live --symbol EURUSD --tf M5
+```
+
+### Paper
+
+```powershell
+python -m src.bot_live --symbol EURUSD --tf M5 --paper --paper-bars 800
+```
+
+### Diagnostico (nao envia ordens)
+
+```powershell
+python -m src.bot_live --symbol EURUSD --tf M5 --diagnostic-only --out reports --out-name diag_m5
+```
+
+## Selecao de modelo no bot
+
+`bot_live` suporta:
+
+- `--model-symbol`
+- `--model-tf`
+- `--model-version`
+- `--use-latest-model` (padrao)
+- `--no-use-latest-model`
+
+Exemplo (latest):
+
+```powershell
+python -m src.bot_live --symbol EURUSD --tf M5 --model-symbol EURUSD --model-tf M5 --use-latest-model
+```
+
+Exemplo (versao fixa):
+
+```powershell
+python -m src.bot_live --symbol EURUSD --tf M5 --model-symbol EURUSD --model-tf M5 --model-version 20260303_120000 --no-use-latest-model
+```
+
+## Validacao de schema antes do trade
+
+Ao iniciar, o bot valida `features_schema.json` do modelo contra as features live.
+
+Se faltar feature obrigatoria do schema:
+
+- gera `kill_switch` com motivo `MISSING_FEATURES_SCHEMA`
+- nao opera com shape incompativel
+
+## Fases de robustez
+
+Runners disponiveis (estado atual):
+
+- `phase4_runner.py`
+- `phase5_runner.py`
+- `phase6_runner.py`
+- `phase7_runner.py`
+- `phase8_runner.py`
+- `phase9_runner.py`
+- `phase10_runner.py`
+- `phase11_runner.py`
 
 Exemplos:
 
 ```powershell
-python -m src.backtest_engine --symbol EURUSD --tf H1 --threshold 0.60
-python -m src.phase8_runner --symbol EURUSD --seed 42 --windows 8
-python -m src.phase9_runner --symbol EURUSD --seed 42
+python -m src.phase10_runner --symbol EURUSD --tf_entry M5 --tf_gate M30 --windows 8 --seed 42
+python -m src.phase11_runner --symbol EURUSD --windows 8 --seed 42
 ```
 
-Saidas ficam em `reports/` (json/csv por fase).
+## Logs
 
-## 7) Rodar bot live
+### Logs live
 
-### 7.1 Teste unico sem enviar ordem
-
-```powershell
-python -m src.bot_live --symbol EURUSD --tf M15 --once --no-trade
-```
-
-### 7.2 Rodar continuo com ordens
-
-```powershell
-python -m src.bot_live --symbol EURUSD --tf M15
-```
-
-Observacoes:
-- O bot decide no fechamento de candle do timeframe.
-- Em `M15`, ha ate 96 verificacoes por dia.
-- O envio de ordem depende de probabilidade + filtros + risco.
-
-## 8) Telegram
-
-Configure:
-
-```powershell
-setx MT5_TELEGRAM_BOT_TOKEN "SEU_TOKEN"
-setx MT5_TELEGRAM_CHAT_ID "SEU_CHAT_ID"
-```
-
-Eventos notificados:
-- inicio do bot
-- nova entrada
-- falha de ordem
-- sinal bloqueado
-- kill switch
-- posicao fechada
-- alerta de saude do modelo
-
-## 9) Logs
-
-### 9.1 Log tecnico JSON
-
-Arquivo:
-- `logs/bot_live.log`
-
-### 9.2 Log humano PT-BR
-
-Arquivo:
-- `logs/bot_live_human.log`
+- Tecnico JSON: `logs/bot_live.log`
+- Humano: `logs/bot_live_human.log`
 
 Visualizar em tempo real:
 
@@ -145,31 +246,59 @@ Visualizar em tempo real:
 Get-Content logs\bot_live_human.log -Wait
 ```
 
-## 10) Configuracao central
+### Diagnostico por hora
 
-Arquivo:
-- `src/config.py`
+No modo `--diagnostic-only`, gera sumarios periodicos com contadores de bloqueio.
+
+## Trades ativos em tempo real (menu opcao 10)
+
+Mostra tabela com:
+
+- Ticket
+- Simbolo
+- Tipo
+- Lote
+- Preco de entrada
+- SL/TP
+- PnL atual
+- Duracao da posicao
+
+Sem travar o bot em background.
+
+## Configuracao central
+
+Arquivo: `src/config.py`
 
 Principais grupos:
-- `RiskConfig`: limites de risco e sizing
-- `TripleBarrierConfig`: parametros SL/TP/horizonte
-- `LiveConfig`: threshold, filtros, time stop, monitor de saude
-- `FeatureConfig`: janelas dos indicadores
 
-## 11) Melhorias implementadas na versao atual
+- `RiskConfig`
+- `GlobalRiskConfig`
+- `LiveConfig`
+- `TripleBarrierConfig`
+- `FeatureConfig`
+- `TimeframeConfig` (M5/M30/M1 etc.)
 
-- Multi-timeframe e alinhamento sem lookahead
-- Auditoria de cobertura por janela
-- Camada de risco (sizing/circuit breaker/cooldown) para robustez
-- Fechamento por time stop (configuravel)
-- Filtros de sessao, noticia e spread
-- Features de suporte/resistencia
-- Logs humanos coloridos no terminal
-- Notificacoes Telegram em PT-BR com emojis
+## Troubleshooting
 
-## 12) Aviso de risco
+### Erro: dataset nao encontrado
 
-Trading envolve risco elevado.
-Use conta DEMO para validacao.
-Nao ha garantia de lucro futuro, mesmo com bons resultados passados.
+Gere automaticamente pelo menu (opcao 2), ou rode manualmente:
 
+```powershell
+python -m src.data_feed --symbol XAUUSD --tfs M5 --months 24
+python -m src.build_dataset --symbol XAUUSD --tf M5
+```
+
+### Dataset vazio (0 linhas)
+
+Normalmente significa:
+
+- simbolo inexistente no broker (ex: usar `XAUUSDm` em vez de `XAUUSD`)
+- historico insuficiente no MT5
+
+Use a selecao por lista no menu para achar o nome real do ativo.
+
+## Aviso de risco
+
+Trading envolve risco elevado. Use conta demo para validacao.
+Resultados passados nao garantem resultado futuro.

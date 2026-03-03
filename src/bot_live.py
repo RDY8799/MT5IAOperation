@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -9,16 +9,19 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
 
-from .config import CONFIG
+from .config import CONFIG, TimeframeConfig
 from .executor_mt5 import close_position, send_order
 from .features import build_features
+from .global_risk import GlobalRiskCoordinator
 from .multitf import BUY, SELL, WAIT, align_h4_to_h1, apply_policy
 from .mt5_connect import ensure_logged_in, shutdown
+from .model_registry import get_latest_model, get_model
 from .notifier_telegram import send_telegram
 from .risk_manager import AccountState, TodayStats, can_open_trade
 from .utils_time import timeframe_minutes, wait_seconds_to_next_candle
@@ -51,6 +54,7 @@ TF_TO_MT5 = {
 
 DROP_COLS = {"time", "y", "t1", "pt", "sl", "regime_class"}
 _CONSOLE = Console() if Console else None
+_GLOBAL_COORD = GlobalRiskCoordinator()
 
 
 def _fmt_local_ts() -> str:
@@ -109,6 +113,32 @@ def _pretty_line(payload: dict) -> str:
         parts.append(f"ordem={payload.get('order_id')}")
     if "ticket" in payload:
         parts.append(f"ticket={payload.get('ticket')}")
+    if payload.get("entry_signal") is not None:
+        parts.append(f"entry={payload.get('entry_signal')}")
+    if payload.get("gate_signal") is not None:
+        parts.append(f"gate={payload.get('gate_signal')}")
+    if payload.get("conflict_detail"):
+        parts.append(f"conflito={payload.get('conflict_detail')}")
+    if payload.get("has_gate_pred") is not None:
+        parts.append(f"gate_pred={payload.get('has_gate_pred')}")
+    if payload.get("has_entry_pred") is not None:
+        parts.append(f"entry_pred={payload.get('has_entry_pred')}")
+    if payload.get("reason_missing_gate_pred"):
+        parts.append(f"missing_gate={payload.get('reason_missing_gate_pred')}")
+    if payload.get("reason_missing_entry_pred"):
+        parts.append(f"missing_entry={payload.get('reason_missing_entry_pred')}")
+    if payload.get("entry_prob_diff") is not None:
+        parts.append(f"margem_entry={float(payload.get('entry_prob_diff')):.3f}")
+    if payload.get("gate_prob_diff") is not None:
+        parts.append(f"margem_gate={float(payload.get('gate_prob_diff')):.3f}")
+    if payload.get("threshold_used") is not None:
+        parts.append(f"thr={float(payload.get('threshold_used')):.2f}")
+    if payload.get("min_signal_margin_used") is not None:
+        parts.append(f"min_margem={float(payload.get('min_signal_margin_used')):.2f}")
+    if payload.get("global_risk_current_pct") is not None:
+        parts.append(f"risco_global={float(payload.get('global_risk_current_pct')):.2f}%")
+    if payload.get("max_trades_window_count") is not None:
+        parts.append(f"trades_60m={int(payload.get('max_trades_window_count'))}")
     return " | ".join(parts)
 
 
@@ -203,14 +233,11 @@ def _notify_telegram(message: str, key: str, cooldown_seconds: int = 0) -> None:
 
 
 def _emoji_decision(decision: str) -> str:
-    return {"BUY": "🟢 COMPRA", "SELL": "🔴 VENDA", "WAIT": "🟡 AGUARDAR"}.get(decision, decision)
+    return {"BUY": "ðŸŸ¢ COMPRA", "SELL": "ðŸ”´ VENDA", "WAIT": "ðŸŸ¡ AGUARDAR"}.get(decision, decision)
 
 
 def _latest_model(symbol: str, timeframe: str) -> Path:
-    files = sorted(CONFIG.models_dir.glob(f"{symbol}_{timeframe}_*.pkl"))
-    if not files:
-        raise FileNotFoundError(f"No model found for {symbol}/{timeframe}")
-    return files[-1]
+    return get_latest_model(symbol=symbol, timeframe=timeframe).model_path
 
 
 def _fetch_recent(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
@@ -271,14 +298,22 @@ def _normalize_lot(symbol: str, lot: float) -> float:
     return float(round(normalized, decimals))
 
 
-def _compute_live_lot(symbol: str, side: str, balance: float, entry_price: float, sl_price: float) -> float:
+def _compute_live_lot(
+    symbol: str,
+    side: str,
+    balance: float,
+    entry_price: float,
+    sl_price: float,
+    risk_pct_override: float | None = None,
+) -> float:
     cfg = CONFIG.risk
     fallback = _normalize_lot(symbol, cfg.fixed_demo_lot)
     if not cfg.use_dynamic_position_sizing:
         return fallback
     if mt5 is None or balance <= 0:
         return fallback
-    risk_amount = balance * (cfg.default_risk_pct / 100.0)
+    risk_pct = float(cfg.default_risk_pct if risk_pct_override is None else risk_pct_override)
+    risk_amount = balance * (risk_pct / 100.0)
     if risk_amount <= 0:
         return fallback
     order_type = mt5.ORDER_TYPE_BUY if side.upper() == "BUY" else mt5.ORDER_TYPE_SELL
@@ -411,7 +446,7 @@ def _apply_time_stop(symbol: str, timeframe: str) -> int:
             )
             _notify_telegram(
                 message=(
-                    f"⏱️ Time Stop acionado\n"
+                    f"â±ï¸ Time Stop acionado\n"
                     f"Ativo: {symbol} | TF: {timeframe}\n"
                     f"Ticket: {int(getattr(p, 'ticket'))}\n"
                     f"Tempo aberto: {age_minutes:.1f} min"
@@ -464,12 +499,15 @@ def _closed_position_pnl(ticket: int) -> float | None:
         return None
 
 
-def _notify_closed_positions(symbol: str, known_positions: dict[int, dict]) -> dict[int, dict]:
+def _notify_closed_positions(symbol: str, known_positions: dict[int, dict]) -> tuple[dict[int, dict], list[dict]]:
     current = _current_positions_map(symbol)
     closed_tickets = [t for t in known_positions.keys() if t not in current]
+    closed_events: list[dict] = []
     for ticket in closed_tickets:
         prev = known_positions[ticket]
         pnl = _closed_position_pnl(ticket)
+        _GLOBAL_COORD.unregister_closed_ticket(symbol, ticket)
+        closed_events.append({"ticket": int(ticket), "side": str(prev.get("side", "WAIT"))})
         _json_log(
             {
                 "event": "position_closed_detected",
@@ -483,7 +521,7 @@ def _notify_closed_positions(symbol: str, known_positions: dict[int, dict]) -> d
         pnl_txt = f"{pnl:.2f}" if pnl is not None else "n/a"
         _notify_telegram(
             message=(
-                f"✅ Posição fechada\n"
+                f"âœ… PosiÃ§Ã£o fechada\n"
                 f"Ativo: {symbol}\n"
                 f"Ticket: {ticket}\n"
                 f"Lado: {prev.get('side')} | Volume: {prev.get('volume')}\n"
@@ -492,7 +530,7 @@ def _notify_closed_positions(symbol: str, known_positions: dict[int, dict]) -> d
             key=f"close:{symbol}:{ticket}",
             cooldown_seconds=0,
         )
-    return current
+    return current, closed_events
 
 
 def _decision_from_proba(proba: np.ndarray, classes: list[int]) -> tuple[str, float, float]:
@@ -506,6 +544,82 @@ def _decision_from_proba(proba: np.ndarray, classes: list[int]) -> tuple[str, fl
     return decision, p_buy, p_sell
 
 
+def _decision_to_int(decision: str) -> int:
+    if decision == "BUY":
+        return BUY
+    if decision == "SELL":
+        return SELL
+    return WAIT
+
+
+def _int_to_decision(signal: int) -> str:
+    if int(signal) == BUY:
+        return "BUY"
+    if int(signal) == SELL:
+        return "SELL"
+    return "WAIT"
+
+
+def _resolve_tf_profile(timeframe: str) -> TimeframeConfig | None:
+    profile = CONFIG.timeframe_profiles.get(timeframe)
+    if profile and profile.enabled:
+        return profile
+    return None
+
+
+def _window_trades_count(
+    now_utc: datetime,
+    profile: TimeframeConfig,
+    open_times: deque[datetime],
+) -> int:
+    if profile.trades_window_mode == "fixed_hour":
+        hour_start = now_utc.replace(minute=0, second=0, microsecond=0)
+        return sum(1 for t in open_times if t >= hour_start)
+    cutoff = now_utc - timedelta(minutes=60)
+    return sum(1 for t in open_times if t >= cutoff)
+
+
+def _atr_threshold_values(feats: pd.DataFrame, profile: TimeframeConfig) -> tuple[float, float, float, float]:
+    atr_series = feats["ATR_14"].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    atr_value = float(feats.iloc[-1]["ATR_14"] or 0.0)
+    if len(atr_series) == 0:
+        return atr_value, 0.0, 1e9, 0.0
+    if profile.volatility_threshold_min_mode == "atr_percentile":
+        pmin = float(np.percentile(atr_series.values, profile.volatility_p_min))
+    else:
+        pmin = float(profile.volatility_abs_min)
+    if profile.volatility_threshold_max_mode == "atr_percentile":
+        pmax = float(np.percentile(atr_series.values, profile.volatility_p_max))
+    else:
+        pmax = float(profile.volatility_abs_max)
+    rank = float((atr_series <= atr_value).mean() * 100.0)
+    return atr_value, pmin, pmax, rank
+
+
+def _frequency_blocked(
+    now_utc: datetime,
+    profile: TimeframeConfig,
+    open_times: deque[datetime],
+) -> bool:
+    if profile.max_trades_per_hour <= 0:
+        return False
+    if profile.trades_window_mode == "fixed_hour":
+        hour_start = now_utc.replace(minute=0, second=0, microsecond=0)
+        n = sum(1 for t in open_times if t >= hour_start)
+        return n >= profile.max_trades_per_hour
+    cutoff = now_utc - timedelta(minutes=60)
+    n = sum(1 for t in open_times if t >= cutoff)
+    return n >= profile.max_trades_per_hour
+
+
+def _candles_since(last_time: datetime | None, now_utc: datetime, timeframe: str) -> int:
+    if last_time is None:
+        return 10**9
+    tf_min = max(1, timeframe_minutes(timeframe))
+    diff_min = (now_utc - last_time).total_seconds() / 60.0
+    return int(diff_min // tf_min)
+
+
 def _resolve_model_feature_cols(model, feats: pd.DataFrame) -> list[str]:
     model_cols = list(getattr(model, "feature_name_", []))
     if model_cols:
@@ -517,329 +631,481 @@ def _resolve_model_feature_cols(model, feats: pd.DataFrame) -> list[str]:
     return [c for c in feats.columns if c not in DROP_COLS]
 
 
-def run_live(symbol: str, timeframe: str, once: bool = False, no_trade: bool = False) -> None:
+def _load_model_from_registry(
+    model_symbol: str,
+    model_tf: str,
+    model_version: str | None = None,
+    use_latest_model: bool = True,
+) -> tuple[Any, dict[str, Any]]:
+    entry = (
+        get_latest_model(symbol=model_symbol, timeframe=model_tf)
+        if use_latest_model or not model_version
+        else get_model(symbol=model_symbol, timeframe=model_tf, version=model_version)
+    )
+    model = joblib.load(entry.model_path)
+    schema_features: list[str] = []
+    if entry.features_schema_path and entry.features_schema_path.exists():
+        try:
+            schema = json.loads(entry.features_schema_path.read_text(encoding="utf-8"))
+            schema_features = list(schema.get("features", []))
+        except Exception:
+            schema_features = []
+    meta = {
+        "model_path": str(entry.model_path),
+        "trained_at": entry.trained_at,
+        "model_symbol": model_symbol,
+        "model_tf": model_tf,
+        "model_version": entry.version,
+        "schema_features": schema_features,
+    }
+    return model, meta
+
+
+def run_live(
+    symbol: str,
+    timeframe: str,
+    once: bool = False,
+    no_trade: bool = False,
+    diagnostic_only: bool = False,
+    diagnostic_out_dir: Path | None = None,
+    diagnostic_out_name: str = "diagnostic_summary",
+    model_symbol: str | None = None,
+    model_tf: str | None = None,
+    model_version: str | None = None,
+    use_latest_model: bool = True,
+) -> None:
     if mt5 is None:
         raise RuntimeError("MetaTrader5 package not installed.")
     CONFIG.ensure_dirs()
     if not ensure_logged_in():
         raise RuntimeError("MT5 login failed")
 
-    model = joblib.load(_latest_model(symbol, timeframe))
+    profile = _resolve_tf_profile(timeframe)
+    tf_entry = timeframe
+    tf_gate = profile.tf_gate if profile else timeframe
+    model_symbol = model_symbol or symbol
+    model_tf = model_tf or tf_entry
+    model_entry, model_entry_meta = _load_model_from_registry(
+        model_symbol=model_symbol,
+        model_tf=model_tf,
+        model_version=model_version,
+        use_latest_model=use_latest_model,
+    )
+    if tf_gate != tf_entry:
+        model_gate, model_gate_meta = _load_model_from_registry(
+            model_symbol=model_symbol,
+            model_tf=tf_gate,
+            model_version=None,
+            use_latest_model=True,
+        )
+    else:
+        model_gate = None
+        model_gate_meta = {}
+
     _notify_telegram(
         message=(
-            f"🤖 Bot iniciado\n"
-            f"Ativo: {symbol} | TF: {timeframe}\n"
-            f"Modo sem ordem: {'SIM' if no_trade else 'NÃO'}"
+            f"Bot iniciado\n"
+            f"Ativo: {symbol} | TF entrada: {tf_entry} | TF gate: {tf_gate}\n"
+            f"Modelo: {model_entry_meta.get('model_symbol')}/{model_entry_meta.get('model_tf')} v={model_entry_meta.get('model_version')}\n"
+            f"Treinado em: {model_entry_meta.get('trained_at')}\n"
+            f"Modo sem ordem: {'SIM' if (no_trade or diagnostic_only) else 'NAO'}"
         ),
-        key=f"boot:{symbol}:{timeframe}",
+        key=f"boot:{symbol}:{tf_entry}:{tf_gate}",
         cooldown_seconds=120,
+    )
+    _json_log(
+        {
+            "event": "bot_boot",
+            "symbol": symbol,
+            "tf": tf_entry,
+            "tf_entry": tf_entry,
+            "tf_gate": tf_gate,
+            "model_path": model_entry_meta.get("model_path"),
+            "trained_at": model_entry_meta.get("trained_at"),
+            "model_symbol": model_entry_meta.get("model_symbol"),
+            "model_tf": model_entry_meta.get("model_tf"),
+            "model_version": model_entry_meta.get("model_version"),
+            "gate_model_path": model_gate_meta.get("model_path") if model_gate_meta else None,
+            "diagnostic_only": diagnostic_only,
+            "no_trade": no_trade,
+        }
     )
     failures = 0
     today_stats = TodayStats(trades_count=0, last_trade_time=None)
     known_positions = _current_positions_map(symbol)
     health_buf = deque(maxlen=max(10, CONFIG.live.health_check_every_n_events))
     event_count = 0
+    open_times: deque[datetime] = deque(maxlen=3000)
+    last_open_same_dir: dict[str, datetime | None] = {"BUY": None, "SELL": None}
+    last_close_same_dir: dict[str, datetime | None] = {"BUY": None, "SELL": None}
+    diagnostic_out_dir = diagnostic_out_dir or CONFIG.reports_dir
+    diagnostic_out_dir.mkdir(parents=True, exist_ok=True)
+    last_diag_dump = datetime.now(timezone.utc)
+    diag_counter = {
+        "total_cycles": 0,
+        "ok_count": 0,
+        "blocked_by_tf_conflict_count": 0,
+        "blocked_by_missing_gate_pred_count": 0,
+        "blocked_by_missing_entry_pred_count": 0,
+        "blocked_by_volatility_low_count": 0,
+        "blocked_by_volatility_high_count": 0,
+        "blocked_by_frequency_count": 0,
+        "blocked_by_global_risk_count": 0,
+        "blocked_by_spread_count": 0,
+        "blocked_by_session_count": 0,
+        "blocked_by_news_blackout_count": 0,
+    }
 
     try:
         while True:
-            known_positions = _notify_closed_positions(symbol, known_positions)
-            _apply_time_stop(symbol=symbol, timeframe=timeframe)
-            raw = _fetch_recent(symbol=symbol, timeframe=timeframe, bars=CONFIG.live.fetch_bars)
-            if raw.empty:
+            known_positions, closed_events = _notify_closed_positions(symbol, known_positions)
+            now_utc = datetime.now(timezone.utc)
+            for ev in closed_events:
+                side = str(ev.get("side", "WAIT"))
+                if side in last_close_same_dir:
+                    last_close_same_dir[side] = now_utc
+
+            _apply_time_stop(symbol=symbol, timeframe=tf_entry)
+            raw_entry = _fetch_recent(symbol=symbol, timeframe=tf_entry, bars=CONFIG.live.fetch_bars)
+            if raw_entry.empty:
                 failures += 1
-                _json_log({"event": "fetch_fail", "failures": failures, "symbol": symbol, "tf": timeframe})
+                _json_log({"event": "fetch_fail", "failures": failures, "symbol": symbol, "tf": tf_entry})
                 if failures >= CONFIG.live.max_mt5_failures:
                     _json_log({"event": "kill_switch", "reason": "MAX_MT5_FAILURES"})
-                    _notify_telegram(
-                        message=(
-                            f"🛑 Kill Switch: falhas MT5\n"
-                            f"Ativo: {symbol} | TF: {timeframe}\n"
-                            f"Motivo: MAX_MT5_FAILURES"
-                        ),
-                        key=f"kill:max_fail:{symbol}:{timeframe}",
-                        cooldown_seconds=120,
-                    )
                     break
                 time.sleep(3)
                 continue
             failures = 0
 
-            feats = build_features(raw)
-            if feats.empty:
+            feats_entry = build_features(raw_entry)
+            if feats_entry.empty:
                 time.sleep(3)
                 continue
 
-            feature_cols = _resolve_model_feature_cols(model, feats)
-            row = feats.iloc[[-1]][feature_cols]
-            proba = model.predict_proba(row)[0]
-            classes = model.classes_.tolist()
-            decision, p_buy, p_sell = _decision_from_proba(proba, classes)
+            entry_cols = _resolve_model_feature_cols(model_entry, feats_entry)
+            schema_feats = model_entry_meta.get("schema_features", [])
+            if schema_feats:
+                missing_schema = [c for c in schema_feats if c not in feats_entry.columns]
+                if missing_schema:
+                    _json_log(
+                        {
+                            "event": "kill_switch",
+                            "reason": "MISSING_FEATURES_SCHEMA",
+                            "symbol": symbol,
+                            "tf": tf_entry,
+                            "missing_features_count": len(missing_schema),
+                            "missing_features_sample": missing_schema[:10],
+                            "model_path": model_entry_meta.get("model_path"),
+                        }
+                    )
+                    break
+            row_entry = feats_entry.iloc[[-1]][entry_cols]
+            entry_proba = model_entry.predict_proba(row_entry)[0]
+            entry_classes = model_entry.classes_.tolist()
+            has_entry_pred = True
+            reason_missing_entry_pred: str | None = None
+            p_sell = float(entry_proba[entry_classes.index(0)]) if 0 in entry_classes else 0.0
+            p_buy = float(entry_proba[entry_classes.index(2)]) if 2 in entry_classes else 0.0
+            threshold_used = float(profile.signal_threshold if profile else CONFIG.live.threshold)
+            min_signal_margin_used = float(profile.min_signal_margin if profile else 0.0)
+            prob_diff = abs(p_buy - p_sell)
+            entry_signal = "WAIT"
+            if p_buy >= threshold_used and p_buy > p_sell:
+                entry_signal = "BUY"
+            elif p_sell >= threshold_used and p_sell > p_buy:
+                entry_signal = "SELL"
             confidence = max(p_buy, p_sell)
-            regime_class = str(feats.iloc[-1].get("regime_class", "NEUTRAL"))
-            spread_points = float(feats.iloc[-1].get("spread", 0.0) or 0.0)
-            now_utc = datetime.now(timezone.utc)
+
+            gate_signal = entry_signal
+            gate_probs = {"buy": p_buy, "sell": p_sell}
+            has_gate_pred = True
+            reason_missing_gate_pred: str | None = None
+            if model_gate is not None:
+                raw_gate = _fetch_recent(symbol=symbol, timeframe=tf_gate, bars=CONFIG.live.fetch_bars)
+                feats_gate = build_features(raw_gate) if not raw_gate.empty else pd.DataFrame()
+                if not feats_gate.empty:
+                    gate_cols = _resolve_model_feature_cols(model_gate, feats_gate)
+                    gate_idx = -2 if len(feats_gate) >= 2 else -1
+                    row_gate = feats_gate.iloc[[gate_idx]][gate_cols]
+                    gate_proba = model_gate.predict_proba(row_gate)[0]
+                    gate_classes = model_gate.classes_.tolist()
+                    g_sell = float(gate_proba[gate_classes.index(0)]) if 0 in gate_classes else 0.0
+                    g_buy = float(gate_proba[gate_classes.index(2)]) if 2 in gate_classes else 0.0
+                    gate_signal = "WAIT"
+                    if g_buy >= threshold_used and g_buy > g_sell:
+                        gate_signal = "BUY"
+                    elif g_sell >= threshold_used and g_sell > g_buy:
+                        gate_signal = "SELL"
+                    gate_probs = {"buy": g_buy, "sell": g_sell}
+                else:
+                    gate_signal = "WAIT"
+                    gate_probs = {"buy": 0.0, "sell": 0.0}
+                    has_gate_pred = False
+                    reason_missing_gate_pred = "missing_gate_features"
+            gate_prob_diff = abs(float(gate_probs["buy"]) - float(gate_probs["sell"]))
+
+            regime_class = str(feats_entry.iloc[-1].get("regime_class", "NEUTRAL"))
+            spread_points = float(feats_entry.iloc[-1].get("spread", 0.0) or 0.0)
+            atr_val, atr_p_min_val, atr_p_max_val, atr_rank = (
+                _atr_threshold_values(feats_entry, profile)
+                if profile
+                else (float(feats_entry.iloc[-1].get("ATR_14", 0.0) or 0.0), 0.0, 1e9, 0.0)
+            )
+
+            final_decision = entry_signal
+            block_reason = ""
+            conflict_detail = ""
+            trades_in_window = _window_trades_count(now_utc, profile, open_times) if profile else 0
 
             state = _account_state(symbol)
             if state.balance > 0:
                 loss_pct = max(0.0, (-state.daily_pnl / state.balance) * 100.0)
                 if loss_pct >= CONFIG.risk.max_daily_loss_pct:
                     _json_log({"event": "kill_switch", "reason": "MAX_DAILY_LOSS"})
-                    _notify_telegram(
-                        message=(
-                            f"🛑 Kill Switch: perda diária\n"
-                            f"Ativo: {symbol} | TF: {timeframe}\n"
-                            f"Loss diário: {loss_pct:.2f}%"
-                        ),
-                        key=f"kill:max_loss:{symbol}:{timeframe}",
-                        cooldown_seconds=120,
-                    )
                     break
             if state.margin_level_pct < CONFIG.risk.min_margin_level_pct:
                 _json_log({"event": "kill_switch", "reason": "LOW_MARGIN_LEVEL"})
-                _notify_telegram(
-                    message=(
-                        f"🛑 Kill Switch: margem baixa\n"
-                        f"Ativo: {symbol} | TF: {timeframe}\n"
-                        f"Nível de margem: {state.margin_level_pct:.2f}%"
-                    ),
-                    key=f"kill:margin:{symbol}:{timeframe}",
-                    cooldown_seconds=120,
-                )
                 break
 
-            if decision != "WAIT":
-                if CONFIG.live.use_session_filter and not _is_in_session(now_utc, CONFIG.live.allowed_sessions_utc):
-                    reason = "SESSION_FILTER"
-                    _json_log(
-                        payload := {
-                            "event": "decision_blocked",
-                            "symbol": symbol,
-                            "tf": timeframe,
-                            "decision": decision,
-                            "reason": reason,
-                            "decision_panel": {
-                                "threshold": CONFIG.live.threshold,
-                                "p_buy": p_buy,
-                                "p_sell": p_sell,
-                                "confidence": confidence,
-                                "regime_class": regime_class,
-                                "spread_points": spread_points,
-                            },
-                        }
-                    )
-                    _update_daily_report(payload)
-                    event_count += 1
-                    health_buf.append({"signal": 0, "confidence": confidence})
-                    if once:
-                        break
-                    sleep_s = wait_seconds_to_next_candle(feats.iloc[-1]["time"], timeframe)
-                    _sleep_with_countdown(max(1.0, sleep_s), symbol=symbol, timeframe=timeframe)
-                    continue
-                if _is_news_blackout(now_utc):
-                    reason = "NEWS_BLACKOUT"
-                    _json_log(
-                        payload := {
-                            "event": "decision_blocked",
-                            "symbol": symbol,
-                            "tf": timeframe,
-                            "decision": decision,
-                            "reason": reason,
-                            "decision_panel": {
-                                "threshold": CONFIG.live.threshold,
-                                "p_buy": p_buy,
-                                "p_sell": p_sell,
-                                "confidence": confidence,
-                                "regime_class": regime_class,
-                                "spread_points": spread_points,
-                            },
-                        }
-                    )
-                    _update_daily_report(payload)
-                    event_count += 1
-                    health_buf.append({"signal": 0, "confidence": confidence})
-                    if once:
-                        break
-                    sleep_s = wait_seconds_to_next_candle(feats.iloc[-1]["time"], timeframe)
-                    _sleep_with_countdown(max(1.0, sleep_s), symbol=symbol, timeframe=timeframe)
-                    continue
-                if spread_points > CONFIG.live.max_spread_points:
-                    reason = "SPREAD_FILTER"
-                    _json_log(
-                        payload := {
-                            "event": "decision_blocked",
-                            "symbol": symbol,
-                            "tf": timeframe,
-                            "decision": decision,
-                            "reason": reason,
-                            "decision_panel": {
-                                "threshold": CONFIG.live.threshold,
-                                "p_buy": p_buy,
-                                "p_sell": p_sell,
-                                "confidence": confidence,
-                                "regime_class": regime_class,
-                                "spread_points": spread_points,
-                            },
-                        }
-                    )
-                    _update_daily_report(payload)
-                    event_count += 1
-                    health_buf.append({"signal": 0, "confidence": confidence})
-                    if once:
-                        break
-                    sleep_s = wait_seconds_to_next_candle(feats.iloc[-1]["time"], timeframe)
-                    _sleep_with_countdown(max(1.0, sleep_s), symbol=symbol, timeframe=timeframe)
-                    continue
+            if final_decision != "WAIT":
+                if model_gate is not None and not has_gate_pred:
+                    final_decision = "WAIT"
+                    block_reason = "blocked_by_missing_gate_pred"
+                    conflict_detail = f"entry={tf_entry} {entry_signal} vs gate={tf_gate} WAIT"
+                if not block_reason and model_gate is not None and gate_signal != final_decision:
+                    final_decision = "WAIT"
+                    block_reason = "blocked_by_tf_conflict"
+                    conflict_detail = f"entry={tf_entry} {entry_signal} vs gate={tf_gate} {gate_signal}"
+                if not block_reason and CONFIG.live.use_session_filter and not _is_in_session(now_utc, CONFIG.live.allowed_sessions_utc):
+                    final_decision = "WAIT"
+                    block_reason = "SESSION_FILTER"
+                if not block_reason and _is_news_blackout(now_utc):
+                    final_decision = "WAIT"
+                    block_reason = "NEWS_BLACKOUT"
+                if not block_reason and spread_points > CONFIG.live.max_spread_points:
+                    final_decision = "WAIT"
+                    block_reason = "SPREAD_FILTER"
+                if not block_reason and profile and prob_diff < float(profile.min_signal_margin):
+                    final_decision = "WAIT"
+                    block_reason = "blocked_by_low_signal_margin"
 
-                can_open, reason = can_open_trade(
-                    state,
-                    _positions_count(symbol),
-                    today_stats,
+                if not block_reason and profile:
+                    if atr_val < atr_p_min_val:
+                        final_decision = "WAIT"
+                        block_reason = "blocked_by_volatility_low"
+                    elif atr_val > atr_p_max_val:
+                        final_decision = "WAIT"
+                        block_reason = "blocked_by_volatility_high"
+
+                if not block_reason and profile and _frequency_blocked(now_utc, profile, open_times):
+                    final_decision = "WAIT"
+                    block_reason = "blocked_by_frequency"
+
+                if not block_reason and profile:
+                    candles_since_open = _candles_since(last_open_same_dir.get(entry_signal), now_utc, tf_entry)
+                    if candles_since_open < int(profile.min_candles_between_same_direction_trades):
+                        final_decision = "WAIT"
+                        block_reason = "blocked_by_reentry_rule"
+                    candles_since_close = _candles_since(last_close_same_dir.get(entry_signal), now_utc, tf_entry)
+                    if not block_reason and candles_since_close < int(profile.reentry_block_candles):
+                        final_decision = "WAIT"
+                        block_reason = "blocked_by_reentry_rule"
+
+                if not block_reason:
+                    can_open, reason = can_open_trade(state, _positions_count(symbol), today_stats)
+                    if not can_open:
+                        final_decision = "WAIT"
+                        block_reason = reason
+
+            price = float(feats_entry.iloc[-1]["close"])
+            atr = float(feats_entry.iloc[-1].get("ATR_14", 0.0) or 0.0)
+            sl_dist = CONFIG.triple_barrier.sl_atr_mult * atr
+            tp_dist = CONFIG.triple_barrier.pt_atr_mult * atr
+            sl = price - sl_dist if final_decision == "BUY" else price + sl_dist
+            tp = price + tp_dist if final_decision == "BUY" else price - tp_dist
+            risk_pct_used = float(profile.risk_pct if profile else CONFIG.risk.default_risk_pct)
+            stop_distance_points = float(abs(price - sl) * 1e5) if final_decision != "WAIT" else 0.0
+
+            lot = 0.0
+            regime_mult = 1.0
+            resp = None
+            if final_decision != "WAIT":
+                lot = _compute_live_lot(
+                    symbol=symbol,
+                    side=final_decision,
+                    balance=state.balance,
+                    entry_price=price,
+                    sl_price=sl,
+                    risk_pct_override=risk_pct_used,
                 )
-                if can_open:
-                    atr = float(feats.iloc[-1]["ATR_14"])
-                    price = float(feats.iloc[-1]["close"])
-                    sl_dist = CONFIG.triple_barrier.sl_atr_mult * atr
-                    tp_dist = CONFIG.triple_barrier.pt_atr_mult * atr
-                    if decision == "BUY":
-                        sl = price - sl_dist
-                        tp = price + tp_dist
-                    else:
-                        sl = price + sl_dist
-                        tp = price - tp_dist
-
-                    lot = _compute_live_lot(
-                        symbol=symbol,
-                        side=decision,
-                        balance=state.balance,
-                        entry_price=price,
-                        sl_price=sl,
-                    )
-                    regime_mult_map = {
-                        "TREND": CONFIG.risk.regime_mult_trend,
-                        "HIGH_VOL": CONFIG.risk.regime_mult_high_vol,
-                        "SIDEWAYS": CONFIG.risk.regime_mult_sideways,
-                        "NEUTRAL": CONFIG.risk.regime_mult_neutral,
-                    }
-                    regime_mult = float(regime_mult_map.get(regime_class, CONFIG.risk.regime_mult_neutral))
-                    lot = _normalize_lot(symbol, lot * regime_mult)
-                    ok, resp = (False, None)
-                    if not no_trade:
-                        ok, resp = send_order(
-                            symbol=symbol,
-                            side=decision,
-                            lot=lot,
-                            sl=sl,
-                            tp=tp,
-                            deviation_points=CONFIG.live.order_deviation_points,
-                        )
-                    if ok:
-                        today_stats.trades_count += 1
-                        today_stats.last_trade_time = datetime.now(timezone.utc)
-                        _notify_telegram(
-                            message=(
-                                f"🚀 Nova entrada {_emoji_decision(decision)}\n"
-                                f"Ativo: {symbol} | TF: {timeframe}\n"
-                                f"Preço: {price:.5f}\n"
-                                f"Prob. compra: {p_buy*100:.1f}% | Prob. venda: {p_sell*100:.1f}%\n"
-                                f"SL: {sl:.5f} | TP: {tp:.5f} | Lote: {lot:.2f}\n"
-                                f"Regime: {regime_class} | Spread: {spread_points:.1f}"
-                            ),
-                            key=f"entry:{symbol}:{timeframe}",
-                            cooldown_seconds=30,
-                        )
-                    elif not no_trade:
-                        _notify_telegram(
-                            message=(
-                                f"⚠️ Falha ao enviar ordem {_emoji_decision(decision)}\n"
-                                f"Ativo: {symbol} | TF: {timeframe}\n"
-                                f"Prob. compra: {p_buy*100:.1f}% | Prob. venda: {p_sell*100:.1f}%"
-                            ),
-                            key=f"order_fail:{symbol}:{timeframe}",
-                            cooldown_seconds=60,
-                        )
-                    elif no_trade:
-                        _notify_telegram(
-                            message=(
-                                f"🧪 Sinal (sem envio de ordem) {_emoji_decision(decision)}\n"
-                                f"Ativo: {symbol} | TF: {timeframe}\n"
-                                f"Prob. compra: {p_buy*100:.1f}% | Prob. venda: {p_sell*100:.1f}%"
-                            ),
-                            key=f"dry_signal:{symbol}:{timeframe}",
-                            cooldown_seconds=60,
-                        )
-                    _json_log(
-                        payload := {
-                            "event": "decision",
-                            "symbol": symbol,
-                            "tf": timeframe,
-                            "price": price,
-                            "decision": decision,
-                            "probs": {"buy": p_buy, "sell": p_sell},
-                            "sl": sl,
-                            "tp": tp,
-                            "order_id": getattr(resp, "order", None) if resp else None,
-                            "no_trade": no_trade,
-                            "shap_top_features": _compute_shap_top(model, row),
-                            "can_open_reason": reason,
-                            "decision_panel": {
-                                "threshold": CONFIG.live.threshold,
-                                "p_buy": p_buy,
-                                "p_sell": p_sell,
-                                "confidence": confidence,
-                                "regime_class": regime_class,
-                                "spread_points": spread_points,
-                                "regime_mult": regime_mult,
-                            },
-                        }
-                    )
-                    _update_daily_report(payload)
+                regime_mult_map = {
+                    "TREND": CONFIG.risk.regime_mult_trend,
+                    "HIGH_VOL": CONFIG.risk.regime_mult_high_vol,
+                    "SIDEWAYS": CONFIG.risk.regime_mult_sideways,
+                    "NEUTRAL": CONFIG.risk.regime_mult_neutral,
+                }
+                regime_mult = float(regime_mult_map.get(regime_class, CONFIG.risk.regime_mult_neutral))
+                lot = _normalize_lot(symbol, lot * regime_mult)
+                g_ok, g_reason, _ = _GLOBAL_COORD.can_open(symbol, proposed_risk_pct=risk_pct_used, proposed_lot=lot)
+                if not g_ok:
+                    final_decision = "WAIT"
+                    block_reason = g_reason
                 else:
-                    _json_log(payload := {
-                            "event": "decision_blocked",
-                            "symbol": symbol,
-                            "tf": timeframe,
-                            "decision": decision,
-                            "reason": reason,
-                            "decision_panel": {
-                                "threshold": CONFIG.live.threshold,
-                                "p_buy": p_buy,
-                                "p_sell": p_sell,
-                                "confidence": confidence,
-                                "regime_class": regime_class,
-                                "spread_points": spread_points,
-                            },
-                        })
-                    _notify_telegram(
-                        message=(
-                            f"⛔ Sinal bloqueado\n"
-                            f"Ativo: {symbol} | TF: {timeframe}\n"
-                            f"Sinal: {_emoji_decision(decision)}\n"
-                            f"Motivo: {reason}"
-                        ),
-                        key=f"blocked:{symbol}:{timeframe}:{reason}",
-                        cooldown_seconds=120,
+                    block_reason = block_reason or "OK"
+            global_snap = _GLOBAL_COORD.snapshot(symbol)
+
+            order_ticket = 0
+            if final_decision != "WAIT":
+                ok = False
+                if not no_trade and not diagnostic_only:
+                    ok, resp = send_order(
+                        symbol=symbol,
+                        side=final_decision,
+                        lot=lot,
+                        sl=sl,
+                        tp=tp,
+                        deviation_points=CONFIG.live.order_deviation_points,
                     )
-                    _update_daily_report(payload)
-            else:
-                _json_log(payload := {
-                        "event": "decision",
-                        "symbol": symbol,
-                        "tf": timeframe,
-                        "decision": decision,
-                        "no_trade": no_trade,
-                        "probs": {"buy": p_buy, "sell": p_sell},
-                        "decision_panel": {
-                            "threshold": CONFIG.live.threshold,
-                            "p_buy": p_buy,
-                            "p_sell": p_sell,
-                            "confidence": confidence,
-                            "regime_class": regime_class,
-                            "spread_points": spread_points,
-                        },
-                    })
-                _update_daily_report(payload)
+                if ok:
+                    order_ticket = int(getattr(resp, "order", 0) or 0)
+                    today_stats.trades_count += 1
+                    today_stats.last_trade_time = now_utc
+                    open_times.append(now_utc)
+                    last_open_same_dir[final_decision] = now_utc
+                    if order_ticket > 0:
+                        _GLOBAL_COORD.register_open_order(symbol, order_ticket, risk_pct_used)
+                elif no_trade or diagnostic_only:
+                    block_reason = "OK"
+                else:
+                    block_reason = "ORDER_FAIL"
+
+            event_name = "decision" if final_decision != "WAIT" or entry_signal == "WAIT" else "decision_blocked"
+            payload = {
+                "event": event_name,
+                "symbol": symbol,
+                "tf": tf_entry,
+                "tf_entry": tf_entry,
+                "tf_gate": tf_gate,
+                "gate_signal": gate_signal,
+                "entry_signal": entry_signal,
+                "has_entry_pred": has_entry_pred,
+                "has_gate_pred": has_gate_pred,
+                "reason_missing_entry_pred": reason_missing_entry_pred,
+                "reason_missing_gate_pred": reason_missing_gate_pred,
+                "decision": final_decision,
+                "final_decision": final_decision,
+                "block_reason": block_reason,
+                "reason": block_reason if final_decision == "WAIT" and block_reason else "",
+                "conflict_entry_tf": tf_entry if block_reason == "blocked_by_tf_conflict" else "",
+                "conflict_gate_tf": tf_gate if block_reason == "blocked_by_tf_conflict" else "",
+                "conflict_detail": conflict_detail,
+                "probs": {"buy": p_buy, "sell": p_sell},
+                "gate_probs": gate_probs,
+                "entry_buy_prob": p_buy,
+                "entry_sell_prob": p_sell,
+                "gate_buy_prob": float(gate_probs["buy"]),
+                "gate_sell_prob": float(gate_probs["sell"]),
+                "entry_prob_diff": prob_diff,
+                "gate_prob_diff": gate_prob_diff,
+                "prob_diff": prob_diff,
+                "threshold_used": threshold_used,
+                "min_signal_margin_used": min_signal_margin_used,
+                "price": price,
+                "spread_points": spread_points,
+                "sl": sl if final_decision != "WAIT" else None,
+                "tp": tp if final_decision != "WAIT" else None,
+                "order_id": order_ticket,
+                "order_ticket": order_ticket,
+                "no_trade": no_trade,
+                "can_open_reason": block_reason,
+                "atr_14_value": atr_val,
+                "atr_p_min_value": atr_p_min_val,
+                "atr_p_max_value": atr_p_max_val,
+                "atr_percentile_current": atr_rank,
+                "risk_pct_used": risk_pct_used if final_decision != "WAIT" else 0.0,
+                "stop_distance_points": stop_distance_points,
+                "position_size_lots": lot,
+                "min_lot": CONFIG.risk.min_lot,
+                "lot_step": float(getattr(mt5.symbol_info(symbol), "volume_step", 0.01) or 0.01) if mt5 else 0.01,
+                "global_risk_current_pct": global_snap.risk_current_pct,
+                "global_positions_count": global_snap.positions_count,
+                "global_daily_loss_pct": global_snap.daily_loss_pct,
+                "new_orders_last_60s": global_snap.new_orders_last_window,
+                "cooldown_active": bool(
+                    today_stats.last_trade_time is not None
+                    and (now_utc - today_stats.last_trade_time).total_seconds() < (CONFIG.risk.cooldown_minutes * 60)
+                ),
+                "max_trades_window_count": int(trades_in_window),
+                "volatility_state": (
+                    "LOW" if atr_val < atr_p_min_val else ("HIGH" if atr_val > atr_p_max_val else "OK")
+                ),
+                "decision_panel": {
+                    "threshold": CONFIG.live.threshold,
+                    "p_buy": p_buy,
+                    "p_sell": p_sell,
+                    "confidence": confidence,
+                    "regime_class": regime_class,
+                    "spread_points": spread_points,
+                    "regime_mult": regime_mult,
+                },
+                "model_info": {
+                    "model_path": model_entry_meta.get("model_path"),
+                    "trained_at": model_entry_meta.get("trained_at"),
+                    "model_symbol": model_entry_meta.get("model_symbol"),
+                    "model_tf": model_entry_meta.get("model_tf"),
+                    "model_version": model_entry_meta.get("model_version"),
+                    "gate_model_path": model_gate_meta.get("model_path"),
+                },
+            }
+            _json_log(payload)
+            _update_daily_report(payload)
+
+            diag_counter["total_cycles"] += 1
+            if final_decision != "WAIT" and block_reason == "OK":
+                diag_counter["ok_count"] += 1
+            if block_reason == "blocked_by_tf_conflict":
+                diag_counter["blocked_by_tf_conflict_count"] += 1
+            if block_reason == "blocked_by_missing_gate_pred":
+                diag_counter["blocked_by_missing_gate_pred_count"] += 1
+            if block_reason == "blocked_by_missing_entry_pred":
+                diag_counter["blocked_by_missing_entry_pred_count"] += 1
+            if block_reason == "blocked_by_volatility_low":
+                diag_counter["blocked_by_volatility_low_count"] += 1
+            if block_reason == "blocked_by_volatility_high":
+                diag_counter["blocked_by_volatility_high_count"] += 1
+            if block_reason == "blocked_by_frequency":
+                diag_counter["blocked_by_frequency_count"] += 1
+            if block_reason.startswith("blocked_by_global_"):
+                diag_counter["blocked_by_global_risk_count"] += 1
+            if block_reason == "SPREAD_FILTER":
+                diag_counter["blocked_by_spread_count"] += 1
+            if block_reason == "SESSION_FILTER":
+                diag_counter["blocked_by_session_count"] += 1
+            if block_reason == "NEWS_BLACKOUT":
+                diag_counter["blocked_by_news_blackout_count"] += 1
+
+            if (now_utc - last_diag_dump).total_seconds() >= 3600:
+                hour_key = now_utc.strftime("%Y-%m-%d_%H")
+                diag_payload = {
+                    "symbol": symbol,
+                    "tf_entry": tf_entry,
+                    "tf_gate": tf_gate,
+                    "diagnostic_only": diagnostic_only,
+                    "timestamp": now_utc.isoformat(),
+                    **diag_counter,
+                }
+                diag_name = (
+                    f"{diagnostic_out_name}_{hour_key}.json"
+                    if diagnostic_out_name and diagnostic_out_name != "diagnostic_summary"
+                    else f"diagnostic_summary_{hour_key}.json"
+                )
+                diag_path = diagnostic_out_dir / diag_name
+                diag_path.write_text(json.dumps(diag_payload, indent=2, default=str), encoding="utf-8")
+                _json_log({"event": "diagnostic_summary", "symbol": symbol, "tf": tf_entry, "path": str(diag_path), **diag_counter})
+                last_diag_dump = now_utc
+
             event_count += 1
-            health_buf.append({"signal": 1 if decision != "WAIT" else 0, "confidence": confidence})
+            health_buf.append({"signal": 1 if final_decision != "WAIT" else 0, "confidence": confidence})
             if event_count % max(1, CONFIG.live.health_check_every_n_events) == 0 and len(health_buf) >= 10:
                 signal_rate = float(np.mean([x["signal"] for x in health_buf]))
                 avg_conf = float(np.mean([x["confidence"] for x in health_buf]))
@@ -847,31 +1113,19 @@ def run_live(symbol: str, timeframe: str, once: bool = False, no_trade: bool = F
                     {
                         "event": "health_monitor",
                         "symbol": symbol,
-                        "tf": timeframe,
+                        "tf": tf_entry,
                         "window_events": len(health_buf),
                         "signal_rate": signal_rate,
                         "avg_confidence": avg_conf,
                     }
                 )
-                if signal_rate < CONFIG.live.min_signal_rate_alert or avg_conf < CONFIG.live.min_confidence_alert:
-                    _notify_telegram(
-                        message=(
-                            f"📉 Alerta de saúde do modelo\n"
-                            f"Ativo: {symbol} | TF: {timeframe}\n"
-                            f"Taxa de sinais: {signal_rate*100:.1f}%\n"
-                            f"Confiança média: {avg_conf*100:.1f}%"
-                        ),
-                        key=f"health_alert:{symbol}:{timeframe}",
-                        cooldown_seconds=300,
-                    )
 
-            # Hypothetical 1-bar result for sanity check in --once mode.
-            if once and len(feats) >= 2:
-                prev_row = feats.iloc[[-2]][feature_cols]
-                prev_close = float(feats.iloc[-2]["close"])
-                curr_close = float(feats.iloc[-1]["close"])
-                prev_proba = model.predict_proba(prev_row)[0]
-                prev_decision, _, _ = _decision_from_proba(prev_proba, classes)
+            if once and len(feats_entry) >= 2:
+                prev_row = feats_entry.iloc[[-2]][entry_cols]
+                prev_close = float(feats_entry.iloc[-2]["close"])
+                curr_close = float(feats_entry.iloc[-1]["close"])
+                prev_proba = model_entry.predict_proba(prev_row)[0]
+                prev_decision, _, _ = _decision_from_proba(prev_proba, entry_classes)
                 ret = 0.0
                 if prev_decision == "BUY":
                     ret = curr_close - prev_close
@@ -881,7 +1135,7 @@ def run_live(symbol: str, timeframe: str, once: bool = False, no_trade: bool = F
                     {
                         "event": "hypothetical_result",
                         "symbol": symbol,
-                        "tf": timeframe,
+                        "tf": tf_entry,
                         "prev_decision": prev_decision,
                         "prev_close": prev_close,
                         "curr_close": curr_close,
@@ -890,22 +1144,35 @@ def run_live(symbol: str, timeframe: str, once: bool = False, no_trade: bool = F
                 )
 
             if once:
-                known_positions = _notify_closed_positions(symbol, known_positions)
+                known_positions, _ = _notify_closed_positions(symbol, known_positions)
                 break
-            sleep_s = wait_seconds_to_next_candle(feats.iloc[-1]["time"], timeframe)
-            _sleep_with_countdown(max(1.0, sleep_s), symbol=symbol, timeframe=timeframe)
+            sleep_s = wait_seconds_to_next_candle(feats_entry.iloc[-1]["time"], tf_entry)
+            _sleep_with_countdown(max(1.0, sleep_s), symbol=symbol, timeframe=tf_entry)
     finally:
         shutdown()
 
-
-def run_paper(symbol: str, timeframe: str, bars: int = 800, out_name: str = "phase5_paper_log.json") -> Path:
+def run_paper(
+    symbol: str,
+    timeframe: str,
+    bars: int = 800,
+    out_name: str = "phase5_paper_log.json",
+    model_symbol: str | None = None,
+    model_tf: str | None = None,
+    model_version: str | None = None,
+    use_latest_model: bool = True,
+) -> Path:
     if mt5 is None:
         raise RuntimeError("MetaTrader5 package not installed.")
     CONFIG.ensure_dirs()
     if not ensure_logged_in():
         raise RuntimeError("MT5 login failed")
     try:
-        model = joblib.load(_latest_model(symbol, timeframe))
+        model, _ = _load_model_from_registry(
+            model_symbol=model_symbol or symbol,
+            model_tf=model_tf or timeframe,
+            model_version=model_version,
+            use_latest_model=use_latest_model,
+        )
         raw = _fetch_recent(symbol=symbol, timeframe=timeframe, bars=bars)
         if raw.empty:
             raise RuntimeError("No bars returned from MT5 for paper mode")
@@ -975,14 +1242,6 @@ def run_paper(symbol: str, timeframe: str, bars: int = 800, out_name: str = "pha
         shutdown()
 
 
-def _decision_to_int(decision: str) -> int:
-    if decision == "BUY":
-        return BUY
-    if decision == "SELL":
-        return SELL
-    return WAIT
-
-
 def run_paper_multitf(
     symbol: str,
     tf_entry: str = "H1",
@@ -990,6 +1249,7 @@ def run_paper_multitf(
     policy: str = "H4_GATE_DIRECTION",
     bars: int = 1200,
     out_name: str = "phase8_paper_multitf_log.json",
+    model_symbol: str | None = None,
 ) -> Path:
     CONFIG.ensure_dirs()
     # Use processed features for stable paper replay; fallback to live fetch if needed.
@@ -1012,8 +1272,19 @@ def run_paper_multitf(
         gate_df = build_features(raw_gate)
         shutdown()
 
-    model_entry = joblib.load(_latest_model(symbol, tf_entry))
-    model_gate = joblib.load(_latest_model(symbol, tf_gate))
+    model_symbol = model_symbol or symbol
+    model_entry, _ = _load_model_from_registry(
+        model_symbol=model_symbol,
+        model_tf=tf_entry,
+        model_version=None,
+        use_latest_model=True,
+    )
+    model_gate, _ = _load_model_from_registry(
+        model_symbol=model_symbol,
+        model_tf=tf_gate,
+        model_version=None,
+        use_latest_model=True,
+    )
     model_entry_cols = list(getattr(model_entry, "feature_name_", []))
     model_gate_cols = list(getattr(model_gate, "feature_name_", []))
     entry_cols = model_entry_cols if model_entry_cols else [c for c in entry_df.columns if c not in DROP_COLS]
@@ -1134,6 +1405,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tf_gate", default="H4")
     parser.add_argument("--policy", default=None, help="Multi-TF paper policy: H4_GATE_DIRECTION|DOUBLE_CONFIRMATION|ENSEMBLE_SCORE")
     parser.add_argument("--out-name", default=None, help="Output report file name in reports/.")
+    parser.add_argument("--diagnostic-only", action="store_true", help="Run full decision pipeline but never send orders.")
+    parser.add_argument("--out", default=None, help="Output directory for diagnostic summaries.")
+    parser.add_argument("--model-symbol", default=None, help="Model symbol override (default = --symbol)")
+    parser.add_argument("--model-tf", default=None, help="Model timeframe override (default = tf entry)")
+    parser.add_argument("--model-version", default=None, help="Specific model version from registry")
+    parser.add_argument("--use-latest-model", dest="use_latest_model", action="store_true", help="Use latest model from registry (default)")
+    parser.add_argument("--no-use-latest-model", dest="use_latest_model", action="store_false", help="Disable latest auto-pick and allow --model-version")
+    parser.set_defaults(use_latest_model=True)
     return parser.parse_args()
 
 
@@ -1149,13 +1428,36 @@ def main() -> None:
                 policy=args.policy,
                 bars=args.paper_bars,
                 out_name=args.out_name or "phase8_paper_multitf_log.json",
+                model_symbol=args.model_symbol,
             )
         else:
-            out = run_paper(symbol=args.symbol, timeframe=tf, bars=args.paper_bars)
+            out = run_paper(
+                symbol=args.symbol,
+                timeframe=tf,
+                bars=args.paper_bars,
+                model_symbol=args.model_symbol,
+                model_tf=args.model_tf,
+                model_version=args.model_version,
+                use_latest_model=args.use_latest_model,
+            )
         print(f"saved={out}")
     else:
-        run_live(symbol=args.symbol, timeframe=tf, once=args.once, no_trade=args.no_trade)
+        diag_dir = Path(args.out) if args.out else CONFIG.reports_dir
+        run_live(
+            symbol=args.symbol,
+            timeframe=tf,
+            once=args.once,
+            no_trade=args.no_trade,
+            diagnostic_only=args.diagnostic_only,
+            diagnostic_out_dir=diag_dir,
+            diagnostic_out_name=args.out_name or "diagnostic_summary",
+            model_symbol=args.model_symbol,
+            model_tf=args.model_tf,
+            model_version=args.model_version,
+            use_latest_model=args.use_latest_model,
+        )
 
 
 if __name__ == "__main__":
     main()
+
