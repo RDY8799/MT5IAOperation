@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Runtime artifacts
+logs/
+reports/
+
+# Data and trained models (heavy/generated)
+data/raw/
+data/processed/
+models/
+
+# OS
+Thumbs.db
+Desktop.ini

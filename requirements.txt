@@ -1,0 +1,12 @@
+MetaTrader5
+pandas
+numpy
+pyarrow
+lightgbm
+scikit-learn
+shap
+statsmodels
+pydantic
+rich
+pytest
+joblib
