@@ -140,19 +140,88 @@ O topo do menu mostra status de:
 - MT5 instalado
 - Login ativo no MT5
 
-Opcoes atuais:
+### Desenho do menu e submenus
 
-1. Listar modelos treinados
-2. Treinar novo modelo
-3. Rodar backtest/robustez (fase)
-4. Rodar bot (paper)
-5. Rodar bot (demo-trade)
-6. Rodar diagnostico (diagnostic-only)
-7. Configurar simbolos/TFs (perfis)
-8. Iniciar trade (background + submenu flags)
-9. Configurar credenciais MT5
-10. Trades ativos (tempo real)
-0. Sair
+```text
+MT5 AI BOT MENU
+├─ 1) Listar modelos treinados
+├─ 2) Treinar novo modelo
+├─ 3) Rodar backtest/robustez (fase)
+├─ 4) Rodar bot (paper)
+├─ 5) Rodar bot (demo-trade)
+├─ 6) Rodar diagnostico (diagnostic-only)
+├─ 7) Configurar simbolos/TFs (perfis)
+├─ 8) Iniciar trade (background + submenu flags)
+│  ├─ simbolo
+│  ├─ tf entrada
+│  ├─ modelo (symbol/tf/version ou latest)
+│  ├─ modo (paper/demo/diagnostic/no-trade)
+│  ├─ gate/policy (quando aplicavel)
+│  └─ flags extras (telegram, logs, etc.)
+├─ 9) Configurar credenciais MT5
+│  ├─ login
+│  ├─ senha
+│  ├─ servidor
+│  └─ caminho do terminal (opcional)
+├─ 10) Trades ativos (tempo real)
+└─ 0) Sair
+```
+
+### Funcoes de cada opcao
+
+1. `Listar modelos treinados`
+- Lê o `Model Registry` e mostra modelos disponíveis por `symbol/tf/version`, data e caminhos.
+
+2. `Treinar novo modelo`
+- Fluxo guiado: símbolo, timeframe, splits e seed.
+- Se não houver dataset, oferece geração automática.
+- Detecta inconsistência de artefatos (`raw/features/dataset`) e oferece limpeza/reconstrução.
+- Salva run em `reports/runs/{run_id}` com logs e metadados.
+
+3. `Rodar backtest/robustez (fase)`
+- Executa runners de fase (`phase4` até `phase11`) com parâmetros escolhidos.
+- Centraliza outputs no `run_id` da execução.
+
+4. `Rodar bot (paper)`
+- Inicia bot sem enviar ordens reais.
+- Útil para validar sinais, bloqueios e coerência de decisão.
+
+5. `Rodar bot (demo-trade)`
+- Inicia bot com envio de ordens na conta demo MT5.
+
+6. `Rodar diagnostico (diagnostic-only)`
+- Roda ciclo completo de decisão sem enviar ordens.
+- Gera contadores por motivo de bloqueio para auditoria.
+
+7. `Configurar simbolos/TFs (perfis)`
+- Salva perfis base por símbolo/timeframe (entry/gate) para reutilização.
+
+8. `Iniciar trade (background + submenu flags)`
+- Inicia `bot_live` em segundo plano (não trava o menu).
+- Permite montar flags de execução antes de iniciar.
+- Registra `PID`, comando e logs da execução.
+
+9. `Configurar credenciais MT5`
+- Persiste credenciais em `reports/runs/mt5_credentials.json`.
+- O menu aplica no ambiente para subprocessos automaticamente.
+
+10. `Trades ativos (tempo real)`
+- Tabela live com posições abertas (ticket, tipo, lote, preço, SL/TP, PnL, duração).
+- Pode filtrar por símbolo.
+
+0. `Sair`
+- Encerra apenas o menu (processos em background continuam rodando).
+
+### Fluxos recomendados
+
+1. Primeiro treino:
+- `2 -> Treinar novo modelo` (com `source=auto`)  
+- depois `4 -> Rodar bot (paper)`  
+- depois `5 -> Rodar bot (demo-trade)` se paper estiver consistente.
+
+2. Diagnóstico de bloqueios:
+- `6 -> Rodar diagnostico`  
+- revisar logs/sumários por motivo (`tf_conflict`, volatilidade, risco global etc.).
 
 ### O que o menu ja automatiza
 

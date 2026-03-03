@@ -57,6 +57,7 @@ _ACTION_LABELS = {
     "train_inconsistent_cancel": "Treino cancelado (inconsistencia)",
     "bot": "Execucao do bot",
     "trade_live": "Trade iniciado (background)",
+    "post_train_flow": "Fluxo pos-treino",
 }
 
 
@@ -770,6 +771,73 @@ def _action_active_trades() -> None:
         _print("Monitor finalizado.", style="cyan")
 
 
+def _action_post_train_flow() -> None:
+    _print("Fluxo recomendado: robustez (phase11) -> paper -> demo", style="cyan")
+    symbol = _choose_symbol("EURUSD")
+    tf = _ask("TF alvo", "M5", to_upper=True)
+    if tf != "M5":
+        _print("Phase11 atual foi desenhada para M5. Use M5 neste fluxo guiado.", style="yellow")
+        return
+    windows = _ask("Janelas walk-forward", "8")
+    seed = _ask("Seed", "42")
+
+    run_id = _run_id(symbol, tf, "phase11_post_train")
+    run_dir = RUNS_DIR / run_id
+    meta = _run_module(
+        module="mt5_ai_bot.src.phase11_runner",
+        args=["--symbol", symbol, "--windows", windows, "--seed", seed],
+        run_dir=run_dir,
+    )
+    _print(f"Phase11 concluida | return_code={meta['return_code']}", style=("green" if meta["return_code"] == 0 else "red"))
+    _print(f"Run meta: {run_dir / 'run_meta.json'}", style="cyan")
+    if meta["return_code"] != 0:
+        _save_last_selection({"symbol": symbol, "tf": tf, "action": "post_train_flow", "run_id": run_id})
+        return
+
+    if _ask_yes_no("Iniciar paper em background agora?", default=True):
+        paper_args = [
+            "--symbol",
+            symbol,
+            "--tf",
+            tf,
+            "--model-symbol",
+            symbol,
+            "--model-tf",
+            tf,
+            "--use-latest-model",
+            "--paper",
+            "--paper-bars",
+            "800",
+        ]
+        paper_run_id = _run_id(symbol, tf, "bot_paper_bg")
+        paper_run_dir = RUNS_DIR / paper_run_id
+        paper_meta = _spawn_module(module="mt5_ai_bot.src.bot_live", args=paper_args, run_dir=paper_run_dir)
+        _print(f"Paper iniciado em background. PID={paper_meta['pid']}", style="green")
+        _print(f"Logs: {paper_meta['stdout_log']}", style="cyan")
+
+    if _ask_yes_no("Iniciar demo-trade em background agora?", default=False):
+        _print("Confirmacao: isso envia ordens na conta demo configurada.", style="yellow")
+        if _ask_yes_no("Confirma iniciar demo-trade?", default=False):
+            demo_args = [
+                "--symbol",
+                symbol,
+                "--tf",
+                tf,
+                "--model-symbol",
+                symbol,
+                "--model-tf",
+                tf,
+                "--use-latest-model",
+            ]
+            demo_run_id = _run_id(symbol, tf, "bot_demo_bg")
+            demo_run_dir = RUNS_DIR / demo_run_id
+            demo_meta = _spawn_module(module="mt5_ai_bot.src.bot_live", args=demo_args, run_dir=demo_run_dir)
+            _print(f"Demo-trade iniciado em background. PID={demo_meta['pid']}", style="green")
+            _print(f"Logs: {demo_meta['stdout_log']}", style="cyan")
+
+    _save_last_selection({"symbol": symbol, "tf": tf, "action": "post_train_flow", "run_id": run_id})
+
+
 def run_menu() -> None:
     _ensure_dirs()
     while True:
@@ -811,6 +879,7 @@ def run_menu() -> None:
         _print("8) Iniciar trade (background + submenu flags)", style="white")
         _print("9) Configurar credenciais MT5", style="white")
         _print("10) Trades ativos (tempo real)", style="white")
+        _print("11) Fluxo pos-treino (phase11 -> paper -> demo)", style="white")
         _print("0) Sair", style="white")
         opt = _ask("Escolha", "1")
         if opt == "1":
@@ -833,6 +902,8 @@ def run_menu() -> None:
             _action_mt5_credentials()
         elif opt == "10":
             _action_active_trades()
+        elif opt == "11":
+            _action_post_train_flow()
         elif opt == "0":
             _print("Saindo.", style="cyan")
             return
