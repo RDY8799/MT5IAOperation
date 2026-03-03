@@ -230,6 +230,8 @@ def _apply_phase10_controls(
 
 
 def _bootstrap(details: pd.DataFrame, sims: int = 2000, seed: int = 42) -> dict[str, Any]:
+    if "signal" not in details.columns or "ret" not in details.columns:
+        return {"simulations": sims, "n_trades_sampled": 0}
     trades = details[details["signal"] != WAIT]["ret"].values
     if len(trades) == 0:
         return {"simulations": sims, "n_trades_sampled": 0}
@@ -403,6 +405,17 @@ def run_phase10(
     details_all = pd.concat(all_details, ignore_index=True) if all_details else pd.DataFrame()
     stress_all = pd.concat(all_stress, ignore_index=True) if all_stress else pd.DataFrame()
 
+    if "window_invalid" not in wf_df.columns:
+        wf_df["window_invalid"] = True
+    if "no_signal_window" not in wf_df.columns:
+        wf_df["no_signal_window"] = True
+    if "trades" not in wf_df.columns:
+        wf_df["trades"] = 0
+    if "profit_factor" not in wf_df.columns:
+        wf_df["profit_factor"] = 0.0
+    if "max_drawdown" not in wf_df.columns:
+        wf_df["max_drawdown"] = 0.0
+
     valid_mask = ~wf_df["window_invalid"]
     valid_windows = int(valid_mask.sum())
     no_signal_windows = int((valid_mask & wf_df["no_signal_window"]).sum())
@@ -411,9 +424,13 @@ def run_phase10(
     dd_windows_ok = bool((wf_df.loc[valid_mask, "max_drawdown"] >= -0.05).all()) if valid_windows else False
     coverage_ratio = float((coverage_df["coverage_ratio"] >= 0.90).mean()) if not coverage_df.empty else 0.0
     trade_windows_count = int((wf_df["trades"] > 0).sum()) if not wf_df.empty else 0
-    trades_total = int((details_all["signal"] != WAIT).sum()) if not details_all.empty else 0
+    trades_total = (
+        int((details_all["signal"] != WAIT).sum())
+        if (not details_all.empty and "signal" in details_all.columns)
+        else 0
+    )
 
-    if not stress_all.empty:
+    if not stress_all.empty and "ret" in stress_all.columns:
         stress_returns = stress_all["ret"].astype(float)
         gp = float(stress_returns[stress_returns > 0].sum())
         gl = float(-stress_returns[stress_returns < 0].sum())
@@ -421,14 +438,16 @@ def run_phase10(
     else:
         stress_pf = 0.0
 
+    ret_series = details_all["ret"] if (not details_all.empty and "ret" in details_all.columns) else pd.Series(dtype=float)
+
     grid_row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol,
         "tf_entry": entry_tf,
         "tf_gate": gate_tf,
         "trades": trades_total,
-        "profit_factor": profit_factor(details_all["ret"]) if not details_all.empty else 0.0,
-        "max_drawdown": max_drawdown(details_all["ret"]) if not details_all.empty else 0.0,
+        "profit_factor": profit_factor(ret_series) if not ret_series.empty else 0.0,
+        "max_drawdown": max_drawdown(ret_series) if not ret_series.empty else 0.0,
         "pf_gt_1_ratio_valid_only": pf_gt_1_ratio,
         "dd_windows_ok": dd_windows_ok,
         "stress25_pf": stress_pf,

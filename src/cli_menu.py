@@ -4,10 +4,12 @@ import argparse
 from collections import deque
 import json
 import os
+from queue import Empty, Queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -172,7 +174,7 @@ def _choose_symbol(default: str = "EURUSD") -> str:
     names = _available_symbols()
     if not names:
         return _ask("Simbolo", default, to_upper=True)
-    filt = _ask("Filtro de simbolo (ENTER=todos)", default[:3], to_upper=True)
+    filt = _ask("Filtro de simbolo (ENTER=todos)", "", to_upper=True)
     filtered = [n for n in names if filt in n] if filt else names
     if not filtered:
         _print(f"Nenhum simbolo com filtro '{filt}'. Usando digitacao manual.", style="yellow")
@@ -219,6 +221,132 @@ def _ask_yes_no(prompt: str, default: bool = False) -> bool:
     d = "s" if default else "n"
     raw = _ask(f"{prompt} (s/n)", d).strip().lower()
     return raw in {"s", "sim", "y", "yes", "1", "true"}
+
+
+def _pause_continue() -> None:
+    prompt = "Pressione ENTER para voltar ao menu..."
+    if _CONSOLE is not None:
+        _CONSOLE.print(f"[dim]{prompt}[/dim]")
+    else:
+        print(prompt)
+    try:
+        input()
+    except EOFError:
+        return
+
+
+def _tail_lines(path: Path, n: int = 20) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore").splitlines()[-n:]
+    except Exception:
+        return []
+
+
+def _print_run_result(run_dir: Path, meta: dict[str, Any]) -> None:
+    _print(f"Run meta: {run_dir / 'run_meta.json'}", style="cyan")
+    rc = int(meta.get("return_code", 1))
+    if rc == 0:
+        return
+    _print(f"Execucao falhou (return_code={rc}).", style="red")
+    tail = _tail_lines(run_dir / "logs" / "stderr.log", n=30)
+    if not tail:
+        tail = _tail_lines(run_dir / "logs" / "stdout.log", n=30)
+    if not tail:
+        _print("Sem detalhes nos logs.", style="yellow")
+        return
+    _print("Ultimas linhas do erro:", style="yellow")
+    for line in tail[-12:]:
+        if line.strip():
+            _print(f"  {line}", style="yellow")
+
+
+def _find_summary_path(meta: dict[str, Any], default_name: str) -> Path | None:
+    for p in meta.get("saved_paths", []):
+        s = str(p)
+        if "summary" in s.lower() and s.lower().endswith(".json"):
+            path = Path(s)
+            if path.exists():
+                return path
+    default = CONFIG.reports_dir / default_name
+    return default if default.exists() else None
+
+
+def _print_phase_summary(summary_path: Path) -> None:
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _print(f"Falha ao ler summary: {summary_path} ({exc})", style="red")
+        return
+    if not isinstance(data, dict):
+        _print(f"Summary invalido: {summary_path}", style="red")
+        return
+
+    # Summary phase10/11 format
+    if "result" in data:
+        result = data.get("result", {})
+        criteria = data.get("criteria", {})
+        approved = bool(data.get("approved", False))
+        symbol = str(data.get("symbol", "-"))
+        entry_tf = str(data.get("entry_tf", "-"))
+        gate_tf = str(data.get("gate_tf", "-"))
+
+        status_txt = "APROVADO" if approved else "REPROVADO"
+        status_style = "green" if approved else "red"
+        _print(f"Resumo da robustez [{symbol} {entry_tf}/{gate_tf}]: {status_txt}", style=status_style)
+        _print(
+            "Metricas: "
+            f"pf_ratio={float(result.get('pf_gt_1_ratio_valid_only', 0.0)):.3f} | "
+            f"dd_windows_ok={bool(result.get('dd_windows_ok', False))} | "
+            f"stress25_pf={float(result.get('stress25_pf', 0.0)):.3f} | "
+            f"trade_windows={int(result.get('trade_windows_count', 0))} | "
+            f"coverage={float(result.get('coverage_ratio', 0.0)):.3f} | "
+            f"trades_total={int(result.get('trades_total', 0))}",
+            style="cyan",
+        )
+        _print(
+            "Criterios minimos: "
+            f"pf_ratio>={float(criteria.get('pf_gt_1_ratio_valid_only_min', 0.6)):.2f}, "
+            f"dd_windows_ok={bool(criteria.get('dd_windows_ok', True))}, "
+            f"stress25_pf>1={bool(criteria.get('stress25_pf_gt_1', True))}, "
+            f"trade_windows>={int(criteria.get('trade_windows_count_min', 6))}, "
+            f"coverage>={float(criteria.get('coverage_ratio_min', 0.9)):.2f}, "
+            f"trades_total>={int(criteria.get('trades_total_min', 120))}",
+            style="white",
+        )
+        if approved:
+            _print("Leitura simples: setup robusto para paper/demo com risco controlado.", style="green")
+        else:
+            _print("Leitura simples: ainda NAO esta robusto; precisa revisar filtros/risco antes de operar.", style="yellow")
+        _print(f"Arquivo resumo: {summary_path}", style="magenta")
+        return
+
+    # Summary phase4 format (diagnostico)
+    by_tf = data.get("by_timeframe", {})
+    if isinstance(by_tf, dict) and by_tf:
+        tf, tf_data = next(iter(by_tf.items()))
+        best = tf_data.get("best_experiment", {}) if isinstance(tf_data, dict) else {}
+        _print(f"Resumo do diagnostico [{data.get('symbol', '-')}/{tf}]", style="cyan")
+        if best:
+            _print(
+                "Melhor experimento: "
+                f"{best.get('experiment_type', '-')}"
+                f" | PF={float(best.get('profit_factor', 0.0)):.3f}"
+                f" | Sharpe={float(best.get('sharpe', 0.0)):.3f}"
+                f" | DD={float(best.get('max_drawdown', 0.0)):.3f}"
+                f" | Trades={int(best.get('trades', 0))}",
+                style="white",
+            )
+            if float(best.get("profit_factor", 0.0)) > 1.0:
+                _print("Leitura simples: existe sinal promissor para esse TF.", style="green")
+            else:
+                _print("Leitura simples: sem robustez clara nesse TF; usar paper/diagnostico antes de demo.", style="yellow")
+        _print(f"Arquivo resumo: {summary_path}", style="magenta")
+        return
+
+    _print("Summary em formato nao reconhecido.", style="yellow")
+    _print(f"Arquivo resumo: {summary_path}", style="magenta")
 
 
 def _print_last_selection(last: dict[str, Any]) -> None:
@@ -269,6 +397,14 @@ def _clean_live_line(line: str) -> str:
     return text
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    ss = s % 60
+    return f"{h:02d}:{m:02d}:{ss:02d}"
+
+
 def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
     logs_dir = run_dir / "logs"
     out_dir = run_dir / "outputs"
@@ -308,16 +444,49 @@ def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
         )
         task = progress.add_task(f"Executando {module}", total=progress_total, completed=0)
         live_lines: deque[str] = deque(maxlen=10)
+        start_ts = time.time()
+        last_output_ts = start_ts
+        line_queue: Queue[Any] = Queue()
+        eof = object()
+
+        def _reader() -> None:
+            try:
+                for raw in proc.stdout:  # type: ignore[union-attr]
+                    line_queue.put(raw.rstrip("\r\n"))
+            finally:
+                line_queue.put(eof)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
 
         def _render() -> Any:
             body = "\n".join(live_lines) if live_lines else "Aguardando atualizacoes..."
-            panel = Panel(body, title="Treino em tempo real", border_style="bright_blue")
+            elapsed = _fmt_elapsed(time.time() - start_ts)
+            silent = _fmt_elapsed(time.time() - last_output_ts)
+            status = f"[dim]Status: rodando | Tempo: {elapsed} | Sem novo log: {silent}[/dim]"
+            panel = Panel(f"{body}\n\n{status}", title="Execucao em tempo real", border_style="bright_blue")
             return Group(progress, panel)
 
         with Live(_render(), console=_CONSOLE, refresh_per_second=5, transient=True) as live:
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip("\r\n")
+            reader_done = False
+            while True:
+                try:
+                    item = line_queue.get(timeout=0.5)
+                except Empty:
+                    live.update(_render())
+                    if reader_done and proc.poll() is not None:
+                        break
+                    continue
+                if item is eof:
+                    reader_done = True
+                    live.update(_render())
+                    if proc.poll() is not None:
+                        break
+                    continue
+
+                line = str(item)
                 stdout_lines.append(line)
+                last_output_ts = time.time()
                 parsed = _parse_progress_line(line)
                 if parsed is not None:
                     saw_progress = True
@@ -558,7 +727,7 @@ def _action_train() -> None:
     _save_last_selection({"symbol": symbol, "tf": tf, "action": "train", "run_id": run_id})
     _print(f"Run: {run_id}", style="green")
     _print(f"Return code: {meta['return_code']}", style="yellow")
-    _print(f"Run meta: {run_dir / 'run_meta.json'}", style="cyan")
+    _print_run_result(run_dir, meta)
 
 
 def _action_phase() -> None:
@@ -585,6 +754,7 @@ def _action_phase() -> None:
     _save_last_selection({"symbol": symbol, "tf": tf, "phase": phase, "run_id": run_id})
     _print(f"Run: {run_id}", style="green")
     _print(f"Return code: {meta['return_code']}", style="yellow")
+    _print_run_result(run_dir, meta)
     if meta["saved_paths"]:
         _print("Saidas:", style="cyan")
         for p in meta["saved_paths"]:
@@ -641,7 +811,7 @@ def _action_bot(paper: bool, diagnostic: bool = False) -> None:
     _save_last_selection({"symbol": symbol, "tf": tf, "action": "bot", "run_id": run_id})
     _print(f"Run: {run_id}", style="green")
     _print(f"Return code: {meta['return_code']}", style="yellow")
-    _print(f"Run meta: {run_dir / 'run_meta.json'}", style="cyan")
+    _print_run_result(run_dir, meta)
 
 
 def _action_start_trade_background() -> None:
@@ -772,24 +942,58 @@ def _action_active_trades() -> None:
 
 
 def _action_post_train_flow() -> None:
-    _print("Fluxo recomendado: robustez (phase11) -> paper -> demo", style="cyan")
+    _print("Fluxo recomendado: robustez -> paper -> demo (adaptativo por TF)", style="cyan")
     symbol = _choose_symbol("EURUSD")
     tf = _ask("TF alvo", "M5", to_upper=True)
-    if tf != "M5":
-        _print("Phase11 atual foi desenhada para M5. Use M5 neste fluxo guiado.", style="yellow")
-        return
     windows = _ask("Janelas walk-forward", "8")
     seed = _ask("Seed", "42")
 
-    run_id = _run_id(symbol, tf, "phase11_post_train")
+    profile = CONFIG.timeframe_profiles.get(tf)
+    if tf == "M5":
+        module = "mt5_ai_bot.src.phase11_runner"
+        args = ["--symbol", symbol, "--windows", windows, "--seed", seed]
+        run_tag = "phase11_post_train"
+        default_summary = "phase11_M5_summary.json"
+        flow_name = "Phase11"
+    elif profile is not None and profile.enabled:
+        module = "mt5_ai_bot.src.phase10_runner"
+        args = [
+            "--symbol",
+            symbol,
+            "--tf_entry",
+            tf,
+            "--tf_gate",
+            profile.tf_gate,
+            "--windows",
+            windows,
+            "--seed",
+            seed,
+        ]
+        run_tag = "phase10_post_train"
+        default_summary = f"phase10_{tf}_summary.json"
+        flow_name = f"Phase10 ({tf}/{profile.tf_gate})"
+    else:
+        module = "mt5_ai_bot.src.phase4_runner"
+        args = ["--symbol", symbol, "--tfs", tf, "--seed", seed]
+        run_tag = "phase4_post_train"
+        default_summary = f"phase4_summary_{symbol}_"
+        flow_name = f"Phase4 diagnostico ({tf})"
+
+    run_id = _run_id(symbol, tf, run_tag)
     run_dir = RUNS_DIR / run_id
-    meta = _run_module(
-        module="mt5_ai_bot.src.phase11_runner",
-        args=["--symbol", symbol, "--windows", windows, "--seed", seed],
-        run_dir=run_dir,
-    )
-    _print(f"Phase11 concluida | return_code={meta['return_code']}", style=("green" if meta["return_code"] == 0 else "red"))
-    _print(f"Run meta: {run_dir / 'run_meta.json'}", style="cyan")
+    meta = _run_module(module=module, args=args, run_dir=run_dir)
+    _print(f"{flow_name} concluida | return_code={meta['return_code']}", style=("green" if meta["return_code"] == 0 else "red"))
+    _print_run_result(run_dir, meta)
+    summary_path = _find_summary_path(meta, default_summary)
+    if summary_path is None and default_summary.endswith("_"):
+        # phase4 fallback: busca por prefixo mais recente
+        cands = sorted(CONFIG.reports_dir.glob(f"{default_summary}*.json"))
+        if cands:
+            summary_path = cands[-1]
+    if summary_path is not None:
+        _print_phase_summary(summary_path)
+    else:
+        _print("Resumo da robustez nao encontrado.", style="yellow")
     if meta["return_code"] != 0:
         _save_last_selection({"symbol": symbol, "tf": tf, "action": "post_train_flow", "run_id": run_id})
         return
@@ -838,6 +1042,161 @@ def _action_post_train_flow() -> None:
     _save_last_selection({"symbol": symbol, "tf": tf, "action": "post_train_flow", "run_id": run_id})
 
 
+def _action_delete_trained_models() -> None:
+    models = list_models()
+    if not models:
+        _print("Nenhum modelo para apagar.", style="yellow")
+        return
+    symbol = _ask("Filtrar simbolo (ENTER=todos)", "", to_upper=True)
+    tf = _ask("Filtrar TF (ENTER=todos)", "", to_upper=True)
+    filtered = [
+        m
+        for m in models
+        if (not symbol or str(m.get("symbol", "")).upper() == symbol)
+        and (not tf or str(m.get("timeframe", "")).upper() == tf)
+    ]
+    if not filtered:
+        _print("Nenhum modelo encontrado com esse filtro.", style="yellow")
+        return
+    if Table is not None and _CONSOLE is not None:
+        tb = Table(title="Modelos para excluir", show_lines=False)
+        tb.add_column("#", style="cyan")
+        tb.add_column("Symbol/TF", style="white")
+        tb.add_column("Versao", style="magenta")
+        tb.add_column("Treinado em", style="green")
+        tb.add_column("Path", style="yellow")
+        for i, m in enumerate(filtered, start=1):
+            tb.add_row(
+                str(i),
+                f"{m.get('symbol')}/{m.get('timeframe')}",
+                str(m.get("version")),
+                str(m.get("trained_at")),
+                str(m.get("model_path", "")),
+            )
+        _CONSOLE.print(tb)
+    else:
+        for i, m in enumerate(filtered, start=1):
+            _print(f"{i}) {m.get('symbol')}/{m.get('timeframe')} v={m.get('version')} path={m.get('model_path')}")
+
+    def _parse_multi_selection(raw: str, max_n: int) -> list[int]:
+        s = raw.strip().lower()
+        if not s or s == "0":
+            return []
+        if s in {"all", "todos"}:
+            return list(range(1, max_n + 1))
+        out: set[int] = set()
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        for p in parts:
+            if "-" in p:
+                a, b = p.split("-", 1)
+                if not a.isdigit() or not b.isdigit():
+                    continue
+                start = int(a)
+                end = int(b)
+                if start > end:
+                    start, end = end, start
+                for i in range(start, end + 1):
+                    if 1 <= i <= max_n:
+                        out.add(i)
+            else:
+                if p.isdigit():
+                    i = int(p)
+                    if 1 <= i <= max_n:
+                        out.add(i)
+        return sorted(out)
+
+    idx_raw = _ask("Numero(s) para excluir (ex: 1,3,5-8 | all | 0=cancelar)", "0")
+    selected_idx = _parse_multi_selection(idx_raw, len(filtered))
+    if not selected_idx:
+        _print("Operacao cancelada.", style="yellow")
+        return
+
+    targets = [filtered[i - 1] for i in selected_idx]
+    _print("Selecionados para exclusao:", style="yellow")
+    for t in targets:
+        _print(f"- {t.get('symbol')}/{t.get('timeframe')} v={t.get('version')}")
+
+    if len(targets) > 1:
+        _print(f"Total: {len(targets)} modelos", style="yellow")
+
+    if not _ask_yes_no("Confirmar exclusao?", default=False):
+        _print("Operacao cancelada.", style="yellow")
+        return
+    confirm_label = _ask("Digite EXCLUIR para confirmar", "")
+    if confirm_label.strip().upper() != "EXCLUIR":
+        _print("Confirmacao nao corresponde. Cancelado.", style="yellow")
+        return
+
+    removed: list[Path] = []
+    failed: list[str] = []
+    for target in targets:
+        paths: list[Path] = []
+        for key in ("model_path", "features_schema_path", "train_meta_path", "metrics_oof_path", "calibration_path"):
+            raw = str(target.get(key, "") or "").strip()
+            if raw:
+                paths.append(Path(raw))
+
+        # garante limpeza de artefatos legados em models/
+        sym = str(target.get("symbol", "")).strip()
+        tf = str(target.get("timeframe", "")).strip()
+        ver = str(target.get("version", "")).strip()
+        if sym and tf and ver:
+            paths.append(CONFIG.models_dir / f"{sym}_{tf}_{ver}.pkl")
+            paths.append(CONFIG.models_dir / f"{sym}_{tf}_{ver}.json")
+
+        # dedup mantendo ordem
+        uniq_paths: list[Path] = []
+        seen: set[str] = set()
+        for p in paths:
+            key = str(p).lower()
+            if key not in seen:
+                seen.add(key)
+                uniq_paths.append(p)
+
+        for p in uniq_paths:
+            try:
+                if p.exists() and p.is_file():
+                    p.unlink()
+                    removed.append(p)
+            except Exception as exc:
+                failed.append(f"{p}: {exc}")
+
+        # remove pasta da versao (reports/models/<symbol>/<tf>/<version>) quando existir
+        model_path = Path(str(target.get("model_path", "")))
+        version_dir = model_path.parent if model_path.name.lower() == "model.bin" else None
+        if version_dir and version_dir.exists() and version_dir.is_dir():
+            try:
+                shutil.rmtree(version_dir)
+                removed.append(version_dir)
+            except Exception as exc:
+                failed.append(f"{version_dir}: {exc}")
+
+    index_path = CONFIG.reports_dir / "models" / "index.json"
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text(encoding="utf-8"))
+            old = data.get("models", [])
+            delete_keys = {
+                (str(t.get("symbol")), str(t.get("timeframe")), str(t.get("version")))
+                for t in targets
+            }
+            kept = [r for r in old if (str(r.get("symbol")), str(r.get("timeframe")), str(r.get("version"))) not in delete_keys]
+            data["models"] = kept
+            index_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        except Exception as exc:
+            _print(f"Falha ao atualizar registry: {exc}", style="red")
+
+    _print(f"Modelos removidos: {len(targets)}", style="green")
+    if removed:
+        _print("Itens removidos:", style="cyan")
+        for p in removed:
+            _print(f"- {p}")
+    if failed:
+        _print("Falhas na remocao:", style="red")
+        for msg in failed:
+            _print(f"- {msg}", style="red")
+
+
 def run_menu() -> None:
     _ensure_dirs()
     while True:
@@ -880,30 +1239,45 @@ def run_menu() -> None:
         _print("9) Configurar credenciais MT5", style="white")
         _print("10) Trades ativos (tempo real)", style="white")
         _print("11) Fluxo pos-treino (phase11 -> paper -> demo)", style="white")
+        _print("13) Gerenciar modelos (apagar)", style="white")
         _print("0) Sair", style="white")
         opt = _ask("Escolha", "1")
         if opt == "1":
             _print_models()
+            _pause_continue()
         elif opt == "2":
             _action_train()
+            _pause_continue()
         elif opt == "3":
             _action_phase()
+            _pause_continue()
         elif opt == "4":
             _action_bot(paper=True, diagnostic=False)
+            _pause_continue()
         elif opt == "5":
             _action_bot(paper=False, diagnostic=False)
+            _pause_continue()
         elif opt == "6":
             _action_bot(paper=False, diagnostic=True)
+            _pause_continue()
         elif opt == "7":
             _action_profiles()
+            _pause_continue()
         elif opt == "8":
             _action_start_trade_background()
+            _pause_continue()
         elif opt == "9":
             _action_mt5_credentials()
+            _pause_continue()
         elif opt == "10":
             _action_active_trades()
+            _pause_continue()
         elif opt == "11":
             _action_post_train_flow()
+            _pause_continue()
+        elif opt == "13":
+            _action_delete_trained_models()
+            _pause_continue()
         elif opt == "0":
             _print("Saindo.", style="cyan")
             return
