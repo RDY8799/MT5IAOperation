@@ -15,7 +15,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    print("PROGRESS 1/2 Gerando features", flush=True)
     feat_path = process_features(symbol=args.symbol, timeframe=args.tf)
+    print("PROGRESS 2/2 Gerando dataset (triple barrier)", flush=True)
     dataset_path = build_dataset(symbol=args.symbol, timeframe=args.tf)
     print(f"features={feat_path}")
     print(f"dataset={dataset_path}")
@@ -23,4 +25,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

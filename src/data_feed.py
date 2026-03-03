@@ -229,7 +229,9 @@ def run_collection(
     end_dt = utc_now()
     mt5_was_used = False
     try:
-        for tf in timeframes:
+        total = max(1, len(timeframes))
+        for i, tf in enumerate(timeframes, start=1):
+            print(f"PROGRESS {i}/{total} Coletando {symbol}/{tf}", flush=True)
             raw, used_source = fetch_rates_with_fallback(
                 symbol=symbol,
                 timeframe=tf,

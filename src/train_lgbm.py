@@ -43,6 +43,13 @@ def train(symbol: str, timeframe: str, n_splits: int = 5, seed: int = 42) -> tup
     t1 = df["t1"]
     y_idx, _, from_idx = _class_map(y)
     class_labels = [from_idx[i] for i in sorted(from_idx)]
+    class_dist = y.value_counts(normalize=True).sort_index().round(4).to_dict()
+    print(
+        "LIVE "
+        f"Dataset: linhas={len(df)} periodo=[{pd.Timestamp(df['time'].min())} -> {pd.Timestamp(df['time'].max())}] "
+        f"features={len(feature_cols)} classes={class_dist}",
+        flush=True,
+    )
 
     cw = compute_class_weight(class_weight="balanced", classes=np.unique(y_idx), y=y_idx)
     class_weights = {i: float(w) for i, w in zip(np.unique(y_idx), cw)}
@@ -52,7 +59,8 @@ def train(symbol: str, timeframe: str, n_splits: int = 5, seed: int = 42) -> tup
     oof_proba = np.zeros((len(df), len(class_labels)), dtype=float)
     last_model = None
 
-    for train_idx, test_idx in splitter.split(X, y, t1):
+    for fold_id, (train_idx, test_idx) in enumerate(splitter.split(X, y, t1), start=1):
+        print(f"PROGRESS {fold_id}/{n_splits} Treinando fold {fold_id}/{n_splits}", flush=True)
         X_train = X.iloc[train_idx][feature_cols]
         X_test = X.iloc[test_idx][feature_cols]
         y_train = y_idx[train_idx]
@@ -75,10 +83,28 @@ def train(symbol: str, timeframe: str, n_splits: int = 5, seed: int = 42) -> tup
             eval_metric="multi_logloss",
             callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
         )
+        best_iter = int(getattr(model, "best_iteration_", 0) or 0)
+        best_score = getattr(model, "best_score_", {}) or {}
+        fold_logloss = None
+        if isinstance(best_score, dict):
+            fold_logloss = best_score.get("valid_0", {}).get("multi_logloss")
         proba = model.predict_proba(X_test)
         pred = np.argmax(proba, axis=1)
         oof_pred[test_idx] = pred
         oof_proba[test_idx] = proba
+        if fold_logloss is not None:
+            print(
+                "LIVE "
+                f"Fold {fold_id}/{n_splits}: train={len(train_idx)} valid={len(test_idx)} "
+                f"best_iter={best_iter} val_logloss={float(fold_logloss):.6f}",
+                flush=True,
+            )
+        else:
+            print(
+                "LIVE "
+                f"Fold {fold_id}/{n_splits}: train={len(train_idx)} valid={len(test_idx)} best_iter={best_iter}",
+                flush=True,
+            )
         last_model = model
 
     if last_model is None:
@@ -112,6 +138,8 @@ def train(symbol: str, timeframe: str, n_splits: int = 5, seed: int = 42) -> tup
         },
     }
     model_path, meta_path = save_model_bundle(last_model, metadata, symbol, timeframe)
+    print(f"PROGRESS {n_splits}/{n_splits} Finalizando e salvando modelo", flush=True)
+    print(f"LIVE Modelo salvo em: {model_path}", flush=True)
     print(json.dumps(metrics, indent=2))
     return str(model_path), str(meta_path)
 

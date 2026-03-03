@@ -169,6 +169,27 @@ Opcoes atuais:
 - Aceita entrada em minusculo para simbolo/TF e normaliza automaticamente
 - Exibe "Ultima selecao" de forma amigavel (painel com acao/par/tf/run_id)
 
+### Progresso real no terminal (sem barra fake)
+
+Durante execucao de modulos pelo menu (coleta, dataset e treino), a barra agora usa progresso real via eventos `PROGRESS x/y`:
+
+- `data_feed`: progresso por timeframe coletado
+- `build_dataset`: 2 etapas (features e dataset)
+- `train_lgbm`: progresso por fold do PurgedKFold
+
+Se o modulo nao emitir `PROGRESS`, o menu finaliza com status concluido, sem simular porcentagem ciclica.
+
+### Painel de diagnostico ao treinar
+
+No treino (`opcao 2`), abaixo da barra aparece painel "Treino em tempo real" com linhas `LIVE`, incluindo:
+
+- resumo do dataset (linhas, periodo, quantidade de features)
+- distribuicao de classes (`y`)
+- por fold: tamanho de treino/validacao, `best_iter`, `val_logloss`
+- caminho final do modelo salvo
+
+Isso melhora visibilidade do que o bot esta calculando enquanto treina.
+
 ## Simbolo por lista (MT5)
 
 No menu, quando pede simbolo:
@@ -313,6 +334,19 @@ Normalmente significa:
 - fallback externo sem historico suficiente para esse ativo/intervalo
 
 Use a selecao por lista no menu para achar o nome real do ativo.
+
+### Barra de progresso "parada" no treino
+
+Se parecer travada em um fold:
+
+- com `splits=10`, cada fold pode demorar varios minutos
+- o progresso avanca quando termina o fold atual
+- verifique `run_meta/logs/stdout.log` para detalhes completos
+
+Para iteracao mais rapida durante desenvolvimento:
+
+- use `splits=5`
+- mantenha `seed=42` para reproducibilidade
 
 ### "Os dados Yahoo sao iguais ao MT5?"
 

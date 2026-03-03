@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,13 +25,14 @@ except ImportError:  # pragma: no cover
     mt5 = None
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
     from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
     from rich.table import Table
 except ImportError:  # pragma: no cover
     Console = None
+    Group = None
     Live = None
     Panel = None
     Progress = None
@@ -239,6 +242,32 @@ def _print_last_selection(last: dict[str, Any]) -> None:
         _print(f"Ultima selecao | Acao: {action_label} | Par: {symbol} | TF: {tf}{extra} | Run ID: {run_id}", style="magenta")
 
 
+_PROGRESS_RE = re.compile(r"^PROGRESS\s+(\d+)\s*/\s*(\d+)(?:\s+(.*))?$")
+
+
+def _parse_progress_line(line: str) -> tuple[int, int, str] | None:
+    m = _PROGRESS_RE.match(line.strip())
+    if not m:
+        return None
+    cur = int(m.group(1))
+    total = int(m.group(2))
+    msg = (m.group(3) or "").strip()
+    if total <= 0:
+        return None
+    return cur, total, msg
+
+
+def _clean_live_line(line: str) -> str:
+    text = line.strip()
+    if not text:
+        return ""
+    if text.startswith("PROGRESS"):
+        return ""
+    if text.startswith("LIVE "):
+        return text[5:].strip()
+    return text
+
+
 def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
     logs_dir = run_dir / "logs"
     out_dir = run_dir / "outputs"
@@ -246,32 +275,79 @@ def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, "-m", module, *args]
     started_at = _now_utc().isoformat()
+    env = _build_subprocess_env()
+    env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         cmd,
         text=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_build_subprocess_env(),
+        stderr=subprocess.STDOUT,
+        env=env,
+        bufsize=1,
     )
-    if _CONSOLE is not None and Progress is not None:
-        with Progress(
+    stdout_lines: list[str] = []
+    saw_progress = False
+    progress_total = 100
+    progress_completed = 0
+    if (
+        _CONSOLE is not None
+        and Progress is not None
+        and Live is not None
+        and Panel is not None
+        and Group is not None
+        and proc.stdout is not None
+    ):
+        progress = Progress(
             SpinnerColumn(),
             TextColumn("[cyan]{task.description}"),
-            BarColumn(bar_width=30),
+            BarColumn(bar_width=40),
             TimeElapsedColumn(),
             console=_CONSOLE,
-            transient=True,
-        ) as progress:
-            task = progress.add_task(f"Executando {module}", total=100)
-            tick = 0
-            while proc.poll() is None:
-                tick = (tick + 1) % 100
-                progress.update(task, completed=tick)
-                time.sleep(0.2)
-            progress.update(task, completed=100)
-    stdout, stderr = proc.communicate()
-    stdout = stdout or ""
-    stderr = stderr or ""
+            transient=False,
+        )
+        task = progress.add_task(f"Executando {module}", total=progress_total, completed=0)
+        live_lines: deque[str] = deque(maxlen=10)
+
+        def _render() -> Any:
+            body = "\n".join(live_lines) if live_lines else "Aguardando atualizacoes..."
+            panel = Panel(body, title="Treino em tempo real", border_style="bright_blue")
+            return Group(progress, panel)
+
+        with Live(_render(), console=_CONSOLE, refresh_per_second=5, transient=True) as live:
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\r\n")
+                stdout_lines.append(line)
+                parsed = _parse_progress_line(line)
+                if parsed is not None:
+                    saw_progress = True
+                    cur, total, msg = parsed
+                    progress_total = max(1, total)
+                    progress_completed = max(0, min(cur, progress_total))
+                    progress.update(
+                        task,
+                        total=progress_total,
+                        completed=progress_completed,
+                        description=(msg or f"Executando {module}"),
+                    )
+                    live.update(_render())
+                    continue
+                clean = _clean_live_line(line)
+                if clean:
+                    live_lines.append(clean)
+                    live.update(_render())
+            proc.wait()
+            if saw_progress:
+                progress.update(task, total=progress_total, completed=progress_total, description=f"{module} concluido")
+            else:
+                progress.update(task, total=100, completed=100, description=f"{module} concluido")
+            live_lines.append("Concluido.")
+            live.update(_render())
+    else:
+        stdout, _ = proc.communicate()
+        stdout_lines = (stdout or "").splitlines()
+
+    stdout = "\n".join(stdout_lines)
+    stderr = ""
     (logs_dir / "stdout.log").write_text(stdout, encoding="utf-8")
     (logs_dir / "stderr.log").write_text(stderr, encoding="utf-8")
 
