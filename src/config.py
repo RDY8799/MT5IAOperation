@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict
 
@@ -234,3 +235,28 @@ class AppConfig(BaseModel):
 
 
 CONFIG = AppConfig()
+
+
+def _apply_timeframe_overrides() -> None:
+    path = CONFIG.reports_dir / "runs" / "timeframe_overrides.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    profiles = data.get("profiles", {}) if isinstance(data, dict) else {}
+    if not isinstance(profiles, dict):
+        return
+    for tf, vals in profiles.items():
+        if tf not in CONFIG.timeframe_profiles or not isinstance(vals, dict):
+            continue
+        current = CONFIG.timeframe_profiles[tf]
+        allowed = set(current.model_fields.keys())
+        updates = {k: v for k, v in vals.items() if k in allowed}
+        if not updates:
+            continue
+        CONFIG.timeframe_profiles[tf] = current.model_copy(update=updates)
+
+
+_apply_timeframe_overrides()

@@ -22,6 +22,11 @@ from .model_registry import list_models
 from .mt5_connect import ensure_logged_in
 
 try:
+    import msvcrt  # Windows-only; usado para sair do monitor com tecla Q
+except ImportError:  # pragma: no cover
+    msvcrt = None
+
+try:
     import MetaTrader5 as mt5
 except ImportError:  # pragma: no cover
     mt5 = None
@@ -49,6 +54,7 @@ RUNS_DIR = CONFIG.reports_dir / "runs"
 LAST_SELECTION = RUNS_DIR / "last_selection.json"
 SYMBOL_PROFILES = RUNS_DIR / "symbol_profiles.json"
 MT5_CREDS_FILE = RUNS_DIR / "mt5_credentials.json"
+TF_OVERRIDES_FILE = RUNS_DIR / "timeframe_overrides.json"
 _CONSOLE = Console() if Console else None
 _ACTION_LABELS = {
     "train": "Treino concluido",
@@ -101,6 +107,30 @@ def _load_json(path: Path, default: Any) -> Any:
 def _save_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _load_tf_overrides() -> dict[str, Any]:
+    data = _load_json(TF_OVERRIDES_FILE, {"profiles": {}})
+    if not isinstance(data, dict):
+        return {"profiles": {}}
+    if not isinstance(data.get("profiles"), dict):
+        data["profiles"] = {}
+    return data
+
+
+def _save_tf_override(tf: str, updates: dict[str, Any], reason: str) -> None:
+    data = _load_tf_overrides()
+    profiles = data.setdefault("profiles", {})
+    base = profiles.get(tf, {})
+    if not isinstance(base, dict):
+        base = {}
+    merged = {**base, **updates, "updated_at": _now_utc().isoformat(), "reason": reason}
+    profiles[tf] = merged
+    _save_json(TF_OVERRIDES_FILE, data)
 
 
 def _save_last_selection(payload: dict[str, Any]) -> None:
@@ -349,6 +379,89 @@ def _print_phase_summary(summary_path: Path) -> None:
     _print(f"Arquivo resumo: {summary_path}", style="magenta")
 
 
+def _extract_summary_approval(summary_path: Path) -> tuple[bool | None, dict[str, Any], dict[str, Any]]:
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, {}, {}
+    if not isinstance(data, dict):
+        return None, {}, {}
+    if "approved" in data and isinstance(data.get("result"), dict):
+        return bool(data.get("approved", False)), data.get("result", {}), data.get("criteria", {})
+    return None, {}, {}
+
+
+def _latest_robustness_summary(tf: str) -> tuple[Path | None, bool | None]:
+    tfu = tf.upper()
+    candidates: list[Path] = []
+    if tfu == "M5":
+        candidates.append(CONFIG.reports_dir / "phase11_M5_summary.json")
+    candidates.append(CONFIG.reports_dir / f"phase10_{tfu}_summary.json")
+    for p in candidates:
+        if p.exists():
+            approved, _, _ = _extract_summary_approval(p)
+            return p, approved
+    return None, None
+
+
+def _check_live_approval_gate(tf: str, action_label: str) -> bool:
+    p, approved = _latest_robustness_summary(tf)
+    if p is None:
+        _print(
+            f"Bloqueado: sem resumo de robustez para {tf}. Rode a opcao 11 antes de {action_label}.",
+            style="red",
+        )
+        return False
+    if approved is True:
+        return True
+    _print(f"Bloqueado: robustez reprovada para {tf}.", style="red")
+    _print(f"Resumo usado: {p}", style="yellow")
+    _print("Para excelencia, demo/live so libera com approved=true.", style="yellow")
+    return False
+
+
+def _auto_tune_profile_from_summary(tf: str, summary_path: Path) -> dict[str, Any]:
+    approved, result, criteria = _extract_summary_approval(summary_path)
+    if approved is None:
+        return {}
+    profile = CONFIG.timeframe_profiles.get(tf)
+    if profile is None:
+        return {}
+    updates: dict[str, Any] = {}
+    pf_ratio = float(result.get("pf_gt_1_ratio_valid_only", 0.0))
+    pf_min = float(criteria.get("pf_gt_1_ratio_valid_only_min", 0.60))
+    stress_pf = float(result.get("stress25_pf", 0.0))
+    trades_total = int(result.get("trades_total", 0))
+    trades_min = int(criteria.get("trades_total_min", 120))
+    trade_windows = int(result.get("trade_windows_count", 0))
+    trade_windows_min = int(criteria.get("trade_windows_count_min", 6))
+
+    # Regra simples: se há excesso de trades e PF/stress ruim, apertar filtros.
+    tighten = (pf_ratio < pf_min and trades_total >= trades_min) or (stress_pf <= 1.0 and trades_total > 500)
+    # Regra oposta: se faltam trades/janelas, relaxar filtros.
+    loosen = (trades_total < trades_min) or (trade_windows < trade_windows_min)
+
+    if tighten and not loosen:
+        updates["signal_threshold"] = round(_clamp(float(profile.signal_threshold) + 0.02, 0.50, 0.75), 3)
+        updates["min_signal_margin"] = round(_clamp(float(profile.min_signal_margin) + 0.02, 0.05, 0.35), 3)
+        updates["volatility_p_min"] = round(_clamp(float(profile.volatility_p_min) + 5.0, 20.0, 80.0), 1)
+        updates["volatility_p_max"] = round(_clamp(float(profile.volatility_p_max) - 3.0, 70.0, 99.0), 1)
+        updates["reentry_block_candles"] = int(_clamp(float(profile.reentry_block_candles + 1), 1, 12))
+    elif loosen and not tighten:
+        updates["signal_threshold"] = round(_clamp(float(profile.signal_threshold) - 0.02, 0.45, 0.75), 3)
+        updates["min_signal_margin"] = round(_clamp(float(profile.min_signal_margin) - 0.02, 0.00, 0.35), 3)
+        updates["volatility_p_min"] = round(_clamp(float(profile.volatility_p_min) - 5.0, 10.0, 80.0), 1)
+        updates["volatility_p_max"] = round(_clamp(float(profile.volatility_p_max) + 3.0, 70.0, 99.0), 1)
+        updates["reentry_block_candles"] = int(_clamp(float(profile.reentry_block_candles - 1), 1, 12))
+    else:
+        # Caso misto: ajuste pequeno apenas em threshold para tentar melhorar robustez sem agressividade.
+        updates["signal_threshold"] = round(_clamp(float(profile.signal_threshold) + 0.01, 0.45, 0.75), 3)
+
+    for k, v in updates.items():
+        setattr(profile, k, v)
+    return updates
+
+
 def _print_last_selection(last: dict[str, Any]) -> None:
     if not last:
         return
@@ -372,6 +485,8 @@ def _print_last_selection(last: dict[str, Any]) -> None:
 
 
 _PROGRESS_RE = re.compile(r"^PROGRESS\s+(\d+)\s*/\s*(\d+)(?:\s+(.*))?$")
+_SYMBOL_RE = re.compile(r"--symbol\s+([A-Za-z0-9._-]+)")
+_TF_RE = re.compile(r"--tf\s+([A-Za-z0-9._-]+)")
 
 
 def _parse_progress_line(line: str) -> tuple[int, int, str] | None:
@@ -548,6 +663,98 @@ def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
     }
     _save_json(run_dir / "run_meta.json", meta)
     return meta
+
+
+def _extract_flag_value(cmdline: str, pattern: re.Pattern[str], default: str = "-") -> str:
+    m = pattern.search(cmdline or "")
+    return m.group(1).upper() if m else default
+
+
+def _infer_mode_from_cmd(cmdline: str) -> str:
+    c = (cmdline or "").lower()
+    if "--diagnostic-only" in c:
+        return "diagnostico"
+    if "--paper" in c:
+        return "paper"
+    if "--no-trade" in c:
+        return "sem-ordem"
+    return "demo/live"
+
+
+def _running_bot_processes() -> list[dict[str, Any]]:
+    cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { "
+        "$_.CommandLine -like '*mt5_ai_bot.src.bot_live*' -and "
+        "$_.Name -match 'python' -and "
+        "$_.CommandLine -like '* -m mt5_ai_bot.src.bot_live*' "
+        "} | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return []
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    rows = data if isinstance(data, list) else [data]
+    result: list[dict[str, Any]] = []
+    for r in rows:
+        pid = int(r.get("ProcessId", 0) or 0)
+        cmdline = str(r.get("CommandLine", "") or "")
+        name = str(r.get("Name", "") or "")
+        if pid <= 0:
+            continue
+        # safety: ignore monitor/query shells even if command line matches
+        if "powershell" in name.lower() or "cmd.exe" in name.lower():
+            continue
+        result.append(
+            {
+                "pid": pid,
+                "name": name,
+                "cmdline": cmdline,
+                "symbol": _extract_flag_value(cmdline, _SYMBOL_RE, default="-"),
+                "tf": _extract_flag_value(cmdline, _TF_RE, default="-"),
+                "mode": _infer_mode_from_cmd(cmdline),
+            }
+        )
+    return result
+
+
+def _running_meta_by_pid() -> dict[int, dict[str, Any]]:
+    out: dict[int, dict[str, Any]] = {}
+    for p in (RUNS_DIR).glob("*/run_meta.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        pid = int(data.get("pid", 0) or 0)
+        if pid <= 0:
+            continue
+        out[pid] = {
+            "run_id": p.parent.parent.name,
+            "stdout_log": str(data.get("stdout_log", "")),
+            "stderr_log": str(data.get("stderr_log", "")),
+            "started_at": str(data.get("started_at", "")),
+        }
+    return out
+
+
+def _tail_text_file(path: Path, n: int = 6) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return []
+    return [ln for ln in lines[-n:] if ln.strip()]
 
 
 def _spawn_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
@@ -805,6 +1012,9 @@ def _build_bot_args_submenu(
 
 def _action_bot(paper: bool, diagnostic: bool = False) -> None:
     symbol, tf, args = _build_bot_args_submenu(paper=paper, diagnostic=diagnostic, force_trade=False)
+    if (not paper) and (not diagnostic):
+        if not _check_live_approval_gate(tf=tf, action_label="demo-trade"):
+            return
     run_id = _run_id(symbol, tf, "bot_paper" if paper else ("bot_diag" if diagnostic else "bot_demo"))
     run_dir = RUNS_DIR / run_id
     meta = _run_module(module="mt5_ai_bot.src.bot_live", args=args, run_dir=run_dir)
@@ -816,6 +1026,8 @@ def _action_bot(paper: bool, diagnostic: bool = False) -> None:
 
 def _action_start_trade_background() -> None:
     symbol, tf, args = _build_bot_args_submenu(paper=False, diagnostic=False, force_trade=True)
+    if not _check_live_approval_gate(tf=tf, action_label="iniciar trade"):
+        return
     # Iniciar trade: garante sem --once e sem --no-trade.
     args = [a for a in args if a != "--once" and a != "--no-trade"]
     run_id = _run_id(symbol, tf, "trade_live")
@@ -941,6 +1153,72 @@ def _action_active_trades() -> None:
         _print("Monitor finalizado.", style="cyan")
 
 
+def _action_running_bots_monitor() -> None:
+    refresh_s = float(_ask("Intervalo de refresh (segundos)", "1"))
+    _print("Monitor continuo. Pressione Q para sair desta tela (ou Ctrl+C).", style="cyan")
+    human_log = CONFIG.logs_dir / "bot_live_human.log"
+
+    if _CONSOLE is not None and Live is not None and Table is not None and Panel is not None and Group is not None:
+        def _render() -> Any:
+            procs = _running_bot_processes()
+            meta_map = _running_meta_by_pid()
+            tb = Table(title="Bots em execucao", show_lines=False)
+            tb.add_column("PID", style="cyan")
+            tb.add_column("Par", style="white")
+            tb.add_column("TF", style="white")
+            tb.add_column("Modo", style="magenta")
+            tb.add_column("Run ID", style="yellow")
+            tb.add_column("Inicio", style="green")
+            if not procs:
+                tb.add_row("-", "-", "-", "-", "-", "-")
+            else:
+                for p in procs:
+                    md = meta_map.get(int(p["pid"]), {})
+                    tb.add_row(
+                        str(p["pid"]),
+                        str(p["symbol"]),
+                        str(p["tf"]),
+                        str(p["mode"]),
+                        str(md.get("run_id", "-")),
+                        str(md.get("started_at", "-")),
+                    )
+            lines = _tail_text_file(human_log, n=8)
+            body = "\n".join(lines) if lines else "Sem logs recentes em logs/bot_live_human.log"
+            panel = Panel(body, title="Logs continuos (human)", border_style="bright_blue")
+            return Group(tb, panel)
+
+        try:
+            with Live(_render(), console=_CONSOLE, refresh_per_second=max(1, int(1 / max(0.2, refresh_s)))) as live:
+                while True:
+                    if msvcrt is not None and msvcrt.kbhit():
+                        ch = msvcrt.getwch()
+                        if str(ch).lower() == "q":
+                            _print("Saindo do monitor (tecla Q).", style="yellow")
+                            break
+                    time.sleep(refresh_s)
+                    live.update(_render())
+        except KeyboardInterrupt:
+            _print("Monitor encerrado pelo usuario.", style="yellow")
+        return
+
+    try:
+        while True:
+            if msvcrt is not None and msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if str(ch).lower() == "q":
+                    _print("Saindo do monitor (tecla Q).", style="yellow")
+                    break
+            procs = _running_bot_processes()
+            _print(f"Bots em execucao: {len(procs)}", style="cyan")
+            for p in procs:
+                _print(f"- PID={p['pid']} {p['symbol']}/{p['tf']} modo={p['mode']}")
+            for ln in _tail_text_file(human_log, n=6):
+                _print(ln)
+            time.sleep(refresh_s)
+    except KeyboardInterrupt:
+        _print("Monitor encerrado pelo usuario.", style="yellow")
+
+
 def _action_post_train_flow() -> None:
     _print("Fluxo recomendado: robustez -> paper -> demo (adaptativo por TF)", style="cyan")
     symbol = _choose_symbol("EURUSD")
@@ -992,6 +1270,38 @@ def _action_post_train_flow() -> None:
             summary_path = cands[-1]
     if summary_path is not None:
         _print_phase_summary(summary_path)
+        approved, _, _ = _extract_summary_approval(summary_path)
+        if approved is False:
+            if _ask_yes_no("Aplicar auto-ajuste IA no perfil agora?", default=True):
+                updates = _auto_tune_profile_from_summary(tf=tf, summary_path=summary_path)
+                if updates:
+                    _save_tf_override(
+                        tf=tf,
+                        updates=updates,
+                        reason=f"auto_tune_after_fail:{summary_path.name}",
+                    )
+                    _print("Auto-ajuste aplicado:", style="green")
+                    for k, v in updates.items():
+                        _print(f"- {k} = {v}", style="cyan")
+                    _print(f"Override salvo em: {TF_OVERRIDES_FILE}", style="magenta")
+                    if _ask_yes_no("Reexecutar robustez agora com ajustes?", default=True):
+                        rerun_id = _run_id(symbol, tf, f"{run_tag}_retune")
+                        rerun_dir = RUNS_DIR / rerun_id
+                        meta2 = _run_module(module=module, args=args, run_dir=rerun_dir)
+                        _print(
+                            f"Reexecucao concluida | return_code={meta2['return_code']}",
+                            style=("green" if meta2["return_code"] == 0 else "red"),
+                        )
+                        _print_run_result(rerun_dir, meta2)
+                        summary2 = _find_summary_path(meta2, default_summary)
+                        if summary2 is None and default_summary.endswith("_"):
+                            cands2 = sorted(CONFIG.reports_dir.glob(f"{default_summary}*.json"))
+                            if cands2:
+                                summary2 = cands2[-1]
+                        if summary2 is not None:
+                            _print_phase_summary(summary2)
+                else:
+                    _print("Nao foi possivel gerar auto-ajuste para esse summary.", style="yellow")
     else:
         _print("Resumo da robustez nao encontrado.", style="yellow")
     if meta["return_code"] != 0:
@@ -1020,6 +1330,9 @@ def _action_post_train_flow() -> None:
         _print(f"Logs: {paper_meta['stdout_log']}", style="cyan")
 
     if _ask_yes_no("Iniciar demo-trade em background agora?", default=False):
+        if not _check_live_approval_gate(tf=tf, action_label="demo-trade"):
+            _save_last_selection({"symbol": symbol, "tf": tf, "action": "post_train_flow", "run_id": run_id})
+            return
         _print("Confirmacao: isso envia ordens na conta demo configurada.", style="yellow")
         if _ask_yes_no("Confirma iniciar demo-trade?", default=False):
             demo_args = [
@@ -1240,6 +1553,7 @@ def run_menu() -> None:
         _print("10) Trades ativos (tempo real)", style="white")
         _print("11) Fluxo pos-treino (phase11 -> paper -> demo)", style="white")
         _print("13) Gerenciar modelos (apagar)", style="white")
+        _print("14) Bots rodando + logs continuos", style="white")
         _print("0) Sair", style="white")
         opt = _ask("Escolha", "1")
         if opt == "1":
@@ -1277,6 +1591,9 @@ def run_menu() -> None:
             _pause_continue()
         elif opt == "13":
             _action_delete_trained_models()
+            _pause_continue()
+        elif opt == "14":
+            _action_running_bots_monitor()
             _pause_continue()
         elif opt == "0":
             _print("Saindo.", style="cyan")

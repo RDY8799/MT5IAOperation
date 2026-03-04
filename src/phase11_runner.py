@@ -10,6 +10,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol", default="EURUSD")
     parser.add_argument("--windows", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--min-signal-margin", type=float, default=None)
     return parser.parse_args()
 
 
@@ -21,12 +23,11 @@ def main() -> None:
         gate_tf="M30",
         windows=args.windows,
         seed=args.seed,
-        threshold=0.55,
-        min_signal_margin=0.15,
+        threshold=args.threshold,
+        min_signal_margin=args.min_signal_margin,
         output_prefix="phase11",
     )
 
 
 if __name__ == "__main__":
     main()
-
