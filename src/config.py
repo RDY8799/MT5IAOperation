@@ -175,7 +175,7 @@ class AppConfig(BaseModel):
                 tf_entry="M5",
                 tf_gate="M30",
                 horizon_candles=12,
-                max_trades_per_hour=1,
+                max_trades_per_hour=5,
                 trades_window_mode="rolling_60m",
                 min_candles_between_same_direction_trades=5,
                 reentry_block_candles=3,
