@@ -73,6 +73,16 @@ setx MT5_PATH "C:\Program Files\MetaTrader 5\terminal64.exe"
 
 - `reports/runs/mt5_credentials.json`
 
+## OpenAI API (auto-ajuste de parametros)
+
+Opcional, para usar auto-ajuste iterativo no fluxo pos-treino:
+
+- Salve pelo menu na opcao `12) Configurar OpenAI API (key/model)`.
+- Arquivo salvo em: `reports/runs/openai_credentials.json`.
+- Campos:
+  - `OPENAI_API_KEY`
+  - `OPENAI_MODEL` (padrao sugerido: `gpt-4.1-mini`)
+
 ## Pipeline de treino (manual)
 
 ### 1) Coletar dados
@@ -164,6 +174,10 @@ MT5 AI BOT MENU
 │  ├─ servidor
 │  └─ caminho do terminal (opcional)
 ├─ 10) Trades ativos (tempo real)
+├─ 12) Configurar OpenAI API (key/model)
+│  ├─ salvar/atualizar OPENAI_API_KEY
+│  ├─ definir OPENAI_MODEL
+│  └─ limpar chave (digitar APAGAR)
 └─ 0) Sair
 ```
 
@@ -208,6 +222,10 @@ MT5 AI BOT MENU
 10. `Trades ativos (tempo real)`
 - Tabela live com posições abertas (ticket, tipo, lote, preço, SL/TP, PnL, duração).
 - Pode filtrar por símbolo.
+
+12. `Configurar OpenAI API (key/model)`
+- Salva chave/modelo para subprocessos do menu.
+- Habilita auto-ajuste iterativo no fluxo pós-treino.
 
 0. `Sair`
 - Encerra apenas o menu (processos em background continuam rodando).

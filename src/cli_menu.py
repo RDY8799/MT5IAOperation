@@ -20,6 +20,7 @@ import pandas as pd
 from .config import CONFIG
 from .model_registry import list_models
 from .mt5_connect import ensure_logged_in
+from .openai_tuner import suggest_profile_updates
 
 try:
     import msvcrt  # Windows-only; usado para sair do monitor com tecla Q
@@ -54,6 +55,7 @@ RUNS_DIR = CONFIG.reports_dir / "runs"
 LAST_SELECTION = RUNS_DIR / "last_selection.json"
 SYMBOL_PROFILES = RUNS_DIR / "symbol_profiles.json"
 MT5_CREDS_FILE = RUNS_DIR / "mt5_credentials.json"
+OPENAI_CREDS_FILE = RUNS_DIR / "openai_credentials.json"
 TF_OVERRIDES_FILE = RUNS_DIR / "timeframe_overrides.json"
 _CONSOLE = Console() if Console else None
 _ACTION_LABELS = {
@@ -93,6 +95,11 @@ def _ensure_dirs() -> None:
     for k, v in creds.items():
         if v:
             os.environ[k] = v
+    openai_creds = _load_openai_credentials()
+    if openai_creds.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = str(openai_creds["OPENAI_API_KEY"])
+    if openai_creds.get("OPENAI_MODEL"):
+        os.environ["OPENAI_MODEL"] = str(openai_creds["OPENAI_MODEL"])
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -147,6 +154,17 @@ def _load_mt5_credentials() -> dict[str, str]:
     return out
 
 
+def _load_openai_credentials() -> dict[str, str]:
+    data = _load_json(OPENAI_CREDS_FILE, {})
+    out: dict[str, str] = {}
+    for k in ("OPENAI_API_KEY", "OPENAI_MODEL"):
+        raw = data.get(k)
+        v = str(raw).strip() if raw is not None else ""
+        if v:
+            out[k] = v
+    return out
+
+
 def _mt5_status() -> dict[str, Any]:
     creds = _load_mt5_credentials()
     has_creds = bool(creds.get("MT5_LOGIN") and creds.get("MT5_PASSWORD") and creds.get("MT5_SERVER"))
@@ -169,10 +187,22 @@ def _mt5_status() -> dict[str, Any]:
     }
 
 
+def _openai_status() -> dict[str, Any]:
+    creds = _load_openai_credentials()
+    has_key = bool(creds.get("OPENAI_API_KEY"))
+    model = str(creds.get("OPENAI_MODEL", "")).strip() or "gpt-4.1-mini"
+    return {"has_key": has_key, "model": model}
+
+
 def _build_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     creds = _load_mt5_credentials()
     env.update(creds)
+    oai = _load_openai_credentials()
+    if oai.get("OPENAI_API_KEY"):
+        env["OPENAI_API_KEY"] = oai["OPENAI_API_KEY"]
+    if oai.get("OPENAI_MODEL"):
+        env["OPENAI_MODEL"] = oai["OPENAI_MODEL"]
     return env
 
 
@@ -457,9 +487,65 @@ def _auto_tune_profile_from_summary(tf: str, summary_path: Path) -> dict[str, An
         # Caso misto: ajuste pequeno apenas em threshold para tentar melhorar robustez sem agressividade.
         updates["signal_threshold"] = round(_clamp(float(profile.signal_threshold) + 0.01, 0.45, 0.75), 3)
 
-    for k, v in updates.items():
-        setattr(profile, k, v)
     return updates
+
+
+def _normalize_profile_updates(tf: str, updates: dict[str, Any]) -> dict[str, Any]:
+    profile = CONFIG.timeframe_profiles.get(tf)
+    if profile is None:
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in updates.items():
+        try:
+            if k == "signal_threshold":
+                out[k] = round(_clamp(float(v), 0.45, 0.80), 3)
+            elif k == "min_signal_margin":
+                out[k] = round(_clamp(float(v), 0.0, 0.40), 3)
+            elif k == "volatility_p_min":
+                out[k] = round(_clamp(float(v), 10.0, 90.0), 1)
+            elif k == "volatility_p_max":
+                out[k] = round(_clamp(float(v), 60.0, 99.0), 1)
+            elif k == "reentry_block_candles":
+                out[k] = int(_clamp(float(v), 1.0, 12.0))
+            elif k == "max_trades_per_hour":
+                out[k] = int(_clamp(float(v), 1.0, 8.0))
+            elif k == "min_candles_between_same_direction_trades":
+                out[k] = int(_clamp(float(v), 0.0, 20.0))
+        except Exception:
+            continue
+    if "volatility_p_min" in out and "volatility_p_max" in out:
+        if float(out["volatility_p_min"]) >= float(out["volatility_p_max"]):
+            out["volatility_p_max"] = round(min(99.0, float(out["volatility_p_min"]) + 5.0), 1)
+    return out
+
+
+def _auto_tune_profile_with_openai(
+    *,
+    tf: str,
+    summary_path: Path,
+    history: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    creds = _load_openai_credentials()
+    api_key = str(creds.get("OPENAI_API_KEY", "")).strip()
+    model = str(creds.get("OPENAI_MODEL", "gpt-4.1-mini")).strip() or "gpt-4.1-mini"
+    if not api_key:
+        return {}, "OPENAI_API_KEY ausente"
+    approved, result, criteria = _extract_summary_approval(summary_path)
+    profile = CONFIG.timeframe_profiles.get(tf)
+    if approved is None or profile is None:
+        return {}, "summary/perfil invalido"
+    profile_payload = profile.model_dump()
+    updates, rationale = suggest_profile_updates(
+        api_key=api_key,
+        model=model,
+        tf=tf,
+        profile=profile_payload,
+        result=result,
+        criteria=criteria,
+        history=history,
+    )
+    normalized = _normalize_profile_updates(tf, updates)
+    return normalized, rationale
 
 
 def _print_last_selection(last: dict[str, Any]) -> None:
@@ -520,7 +606,13 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{ss:02d}"
 
 
-def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
+def _run_module(
+    module: str,
+    args: list[str],
+    run_dir: Path,
+    *,
+    allow_quit_with_q: bool = False,
+) -> dict[str, Any]:
     logs_dir = run_dir / "logs"
     out_dir = run_dir / "outputs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -541,6 +633,7 @@ def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
     saw_progress = False
     progress_total = 100
     progress_completed = 0
+    cancelled_by_user = False
     if (
         _CONSOLE is not None
         and Progress is not None
@@ -585,6 +678,17 @@ def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
         with Live(_render(), console=_CONSOLE, refresh_per_second=5, transient=True) as live:
             reader_done = False
             while True:
+                if allow_quit_with_q and msvcrt is not None and msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if str(ch).lower() == "q":
+                        cancelled_by_user = True
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        live_lines.append("Cancelado pelo usuario (Q).")
+                        live.update(_render())
+                        break
                 try:
                     item = line_queue.get(timeout=0.5)
                 except Empty:
@@ -658,6 +762,7 @@ def _run_module(module: str, args: list[str], run_dir: Path) -> dict[str, Any]:
         "started_at": started_at,
         "finished_at": _now_utc().isoformat(),
         "return_code": int(proc.returncode or 0),
+        "cancelled_by_user": bool(cancelled_by_user),
         "saved_paths": saved_paths,
         "copied_outputs": copied_outputs,
     }
@@ -1079,6 +1184,48 @@ def _action_mt5_credentials() -> None:
         _print("Revise login/senha/servidor e MT5 aberto.", style="yellow")
 
 
+def _mask_secret(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "*" * len(s)
+    return f"{s[:4]}...{s[-4:]}"
+
+
+def _action_openai_credentials() -> None:
+    current = _load_openai_credentials()
+    _print("Configurar OpenAI (salvo em reports/runs/openai_credentials.json)", style="cyan")
+    cur_key = current.get("OPENAI_API_KEY", "")
+    if cur_key:
+        _print(f"OPENAI_API_KEY atual: {_mask_secret(cur_key)}", style="dim")
+    _print("Dica: ENTER vazio mantém valor atual. Digite APAGAR para limpar.", style="dim")
+    key_raw = _ask("OPENAI_API_KEY", "")
+    if key_raw.strip().upper() == "APAGAR":
+        key = ""
+    elif key_raw.strip():
+        key = key_raw.strip()
+    else:
+        key = cur_key
+
+    model_default = current.get("OPENAI_MODEL", "gpt-4.1-mini")
+    model = _ask("OPENAI_MODEL", model_default).strip() or "gpt-4.1-mini"
+
+    payload = {
+        "OPENAI_API_KEY": key,
+        "OPENAI_MODEL": model,
+        "updated_at": _now_utc().isoformat(),
+    }
+    _save_json(OPENAI_CREDS_FILE, payload)
+    if key:
+        os.environ["OPENAI_API_KEY"] = key
+    else:
+        os.environ.pop("OPENAI_API_KEY", None)
+    os.environ["OPENAI_MODEL"] = model
+    _print(f"Credenciais OpenAI salvas em: {OPENAI_CREDS_FILE}", style="green")
+    _print(f"Chave ativa: {'SIM' if bool(key) else 'NAO'} | Modelo: {model}", style="cyan")
+
+
 def _positions_table(symbol_filter: str | None = None) -> tuple[Any, int, float]:
     if mt5 is None:
         return None, 0, 0.0
@@ -1273,21 +1420,75 @@ def _action_post_train_flow() -> None:
         approved, _, _ = _extract_summary_approval(summary_path)
         if approved is False:
             if _ask_yes_no("Aplicar auto-ajuste IA no perfil agora?", default=True):
-                updates = _auto_tune_profile_from_summary(tf=tf, summary_path=summary_path)
-                if updates:
-                    _save_tf_override(
-                        tf=tf,
-                        updates=updates,
-                        reason=f"auto_tune_after_fail:{summary_path.name}",
-                    )
-                    _print("Auto-ajuste aplicado:", style="green")
-                    for k, v in updates.items():
-                        _print(f"- {k} = {v}", style="cyan")
-                    _print(f"Override salvo em: {TF_OVERRIDES_FILE}", style="magenta")
-                    if _ask_yes_no("Reexecutar robustez agora com ajustes?", default=True):
-                        rerun_id = _run_id(symbol, tf, f"{run_tag}_retune")
+                use_openai = _ask_yes_no("Usar OpenAI API para sugerir parametros?", default=True)
+                continuous_mode = _ask_yes_no(
+                    "Modo continuo ate APROVAR? (para apenas com Q ou quando aprovar)",
+                    default=True,
+                )
+                max_iters = int(_ask("Maximo de iteracoes de reteste (0 = infinito)", "0" if continuous_mode else "5"))
+                if max_iters < 0:
+                    max_iters = 0
+                if max_iters > 0:
+                    max_iters = min(max_iters, 200)
+                history: list[dict[str, Any]] = []
+                current_summary = summary_path
+                reached_target = False
+
+                if _ask_yes_no("Reexecutar robustez automaticamente agora?", default=True):
+                    if msvcrt is not None:
+                        _print("Auto-ajuste em andamento. Pressione Q para parar.", style="yellow")
+                    i = 0
+                    while True:
+                        i += 1
+                        if max_iters > 0 and i > max_iters:
+                            break
+                        if msvcrt is not None and msvcrt.kbhit():
+                            ch = msvcrt.getwch()
+                            if str(ch).lower() == "q":
+                                _print("Auto-ajuste interrompido pelo usuario (Q).", style="yellow")
+                                break
+                        if use_openai:
+                            try:
+                                updates, rationale = _auto_tune_profile_with_openai(
+                                    tf=tf,
+                                    summary_path=current_summary,
+                                    history=history,
+                                )
+                            except Exception as exc:
+                                _print(f"OpenAI falhou na iteracao {i}: {exc}", style="yellow")
+                                updates, rationale = {}, "fallback_heuristico"
+                        else:
+                            updates, rationale = {}, "heuristico"
+
+                        if not updates:
+                            updates = _normalize_profile_updates(tf, _auto_tune_profile_from_summary(tf=tf, summary_path=current_summary))
+                            if not updates:
+                                _print("Nao foi possivel gerar ajustes nesta iteracao.", style="yellow")
+                                break
+                            if rationale == "fallback_heuristico":
+                                rationale = "fallback_heuristico_sem_sugestao_openai"
+
+                        _save_tf_override(
+                            tf=tf,
+                            updates=updates,
+                            reason=f"auto_tune_iter_{i}:{rationale}",
+                        )
+                        iter_label = f"{i}/{max_iters}" if max_iters > 0 else f"{i}/INF"
+                        _print(f"[Iteracao {iter_label}] Auto-ajuste aplicado:", style="green")
+                        for k, v in updates.items():
+                            _print(f"- {k} = {v}", style="cyan")
+
+                        rerun_id = _run_id(symbol, tf, f"{run_tag}_retune{i}")
                         rerun_dir = RUNS_DIR / rerun_id
-                        meta2 = _run_module(module=module, args=args, run_dir=rerun_dir)
+                        meta2 = _run_module(
+                            module=module,
+                            args=args,
+                            run_dir=rerun_dir,
+                            allow_quit_with_q=True,
+                        )
+                        if bool(meta2.get("cancelled_by_user", False)):
+                            _print("Reexecucao interrompida pelo usuario (Q).", style="yellow")
+                            break
                         _print(
                             f"Reexecucao concluida | return_code={meta2['return_code']}",
                             style=("green" if meta2["return_code"] == 0 else "red"),
@@ -1298,10 +1499,40 @@ def _action_post_train_flow() -> None:
                             cands2 = sorted(CONFIG.reports_dir.glob(f"{default_summary}*.json"))
                             if cands2:
                                 summary2 = cands2[-1]
-                        if summary2 is not None:
-                            _print_phase_summary(summary2)
-                else:
-                    _print("Nao foi possivel gerar auto-ajuste para esse summary.", style="yellow")
+                        if summary2 is None:
+                            _print("Summary nao encontrado apos reexecucao.", style="yellow")
+                            break
+                        current_summary = summary2
+                        _print_phase_summary(current_summary)
+                        approved2, result2, criteria2 = _extract_summary_approval(current_summary)
+                        history.append(
+                            {
+                                "iteration": i,
+                                "updates": updates,
+                                "approved": approved2,
+                                "pf_ratio": float(result2.get("pf_gt_1_ratio_valid_only", 0.0)) if isinstance(result2, dict) else 0.0,
+                            }
+                        )
+                        pf_ratio = float(result2.get("pf_gt_1_ratio_valid_only", 0.0)) if isinstance(result2, dict) else 0.0
+                        pf_min = float(criteria2.get("pf_gt_1_ratio_valid_only_min", 0.6)) if isinstance(criteria2, dict) else 0.6
+                        approved_flag = bool(approved2) if approved2 is not None else False
+                        if approved_flag:
+                            reached_target = True
+                            _print(
+                                f"Meta atingida: APROVADO | pf_ratio={pf_ratio:.3f} (min={pf_min:.3f}). Encerrando loop.",
+                                style="green",
+                            )
+                            break
+                        _print(
+                            f"Ainda reprovado: approved={approved_flag} | pf_ratio={pf_ratio:.3f} (min={pf_min:.3f}). Seguindo para proxima iteracao.",
+                            style="yellow",
+                        )
+                        if not continuous_mode and max_iters == 0:
+                            # Protecao para evitar loop infinito quando usuario desliga modo continuo.
+                            break
+                    _print(f"Override salvo em: {TF_OVERRIDES_FILE}", style="magenta")
+                    if not reached_target:
+                        _print("Meta de pf_ratio nao foi atingida dentro do limite de iteracoes.", style="yellow")
     else:
         _print("Resumo da robustez nao encontrado.", style="yellow")
     if meta["return_code"] != 0:
@@ -1515,6 +1746,7 @@ def run_menu() -> None:
     while True:
         last = _load_json(LAST_SELECTION, {})
         st = _mt5_status()
+        oai = _openai_status()
         creds_txt = "[green]OK[/green]" if st["has_creds"] else "[red]NAO[/red]"
         installed_txt = "[green]SIM[/green]" if st["installed"] else "[red]NAO[/red]"
         login_txt = (
@@ -1522,6 +1754,7 @@ def run_menu() -> None:
             if st["logged_in"]
             else "[yellow]NAO LOGADO[/yellow]"
         )
+        openai_txt = f"[green]OK ({oai['model']})[/green]" if oai["has_key"] else "[red]NAO[/red]"
         if _CONSOLE is not None and Panel is not None:
             _CONSOLE.print(
                 Panel(
@@ -1529,7 +1762,8 @@ def run_menu() -> None:
                     "[white]Gerenciamento de treino, fases e execucao live[/white]\n"
                     f"[white]Credenciais:[/white] {creds_txt} | "
                     f"[white]MT5 instalado:[/white] {installed_txt} | "
-                    f"[white]Login:[/white] {login_txt}",
+                    f"[white]Login:[/white] {login_txt} | "
+                    f"[white]OpenAI:[/white] {openai_txt}",
                     border_style="bright_blue",
                 )
             )
@@ -1538,7 +1772,8 @@ def run_menu() -> None:
             _print(
                 f"Credenciais={'OK' if st['has_creds'] else 'NAO'} | "
                 f"MT5_instalado={'SIM' if st['installed'] else 'NAO'} | "
-                f"Login={'LOGADO' if st['logged_in'] else 'NAO LOGADO'}"
+                f"Login={'LOGADO' if st['logged_in'] else 'NAO LOGADO'} | "
+                f"OpenAI={'OK' if oai['has_key'] else 'NAO'}"
             )
         _print_last_selection(last)
         _print("1) Listar modelos treinados", style="white")
@@ -1552,6 +1787,7 @@ def run_menu() -> None:
         _print("9) Configurar credenciais MT5", style="white")
         _print("10) Trades ativos (tempo real)", style="white")
         _print("11) Fluxo pos-treino (phase11 -> paper -> demo)", style="white")
+        _print("12) Configurar OpenAI API (key/model)", style="white")
         _print("13) Gerenciar modelos (apagar)", style="white")
         _print("14) Bots rodando + logs continuos", style="white")
         _print("0) Sair", style="white")
@@ -1588,6 +1824,9 @@ def run_menu() -> None:
             _pause_continue()
         elif opt == "11":
             _action_post_train_flow()
+            _pause_continue()
+        elif opt == "12":
+            _action_openai_credentials()
             _pause_continue()
         elif opt == "13":
             _action_delete_trained_models()
