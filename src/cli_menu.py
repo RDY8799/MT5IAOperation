@@ -21,7 +21,7 @@ import pandas as pd
 from .config import CONFIG, get_symbol_profile_entry, resolve_timeframe_profile
 from .model_registry import get_latest_model, list_models
 from .mt5_connect import ensure_logged_in
-from .openai_tuner import suggest_profile_updates
+from .openai_tuner import suggest_profile_update_candidates, suggest_profile_updates
 
 try:
     import msvcrt  # Windows-only; usado para sair do monitor com tecla Q
@@ -150,6 +150,24 @@ def _save_tf_override(tf: str, updates: dict[str, Any], reason: str) -> None:
         base = {}
     merged = {**base, **updates, "updated_at": _now_utc().isoformat(), "reason": reason}
     profiles[tf] = merged
+    _save_json(TF_OVERRIDES_FILE, data)
+
+
+def _get_tf_override_payload(tf: str) -> dict[str, Any]:
+    data = _load_tf_overrides()
+    raw = data.get("profiles", {}).get(tf, {})
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k not in {"updated_at", "reason"}}
+
+
+def _replace_tf_override(tf: str, payload: dict[str, Any], reason: str) -> None:
+    data = _load_tf_overrides()
+    profiles = data.setdefault("profiles", {})
+    clean = {k: v for k, v in payload.items() if k not in {"updated_at", "reason"}}
+    clean["updated_at"] = _now_utc().isoformat()
+    clean["reason"] = reason
+    profiles[tf] = clean
     _save_json(TF_OVERRIDES_FILE, data)
 
 
@@ -495,7 +513,7 @@ def _check_live_approval_gate(tf: str, action_label: str) -> bool:
     return False
 
 
-def _auto_tune_profile_from_summary(tf: str, summary_path: Path) -> dict[str, Any]:
+def _auto_tune_profile_from_summary(symbol: str, tf: str, summary_path: Path) -> dict[str, Any]:
     approved, result, criteria = _extract_summary_approval(summary_path)
     if approved is None:
         return {}
@@ -598,6 +616,7 @@ def _normalize_profile_updates(tf: str, updates: dict[str, Any]) -> dict[str, An
 
 def _auto_tune_profile_with_openai(
     *,
+    symbol: str,
     tf: str,
     summary_path: Path,
     history: list[dict[str, Any]],
@@ -608,7 +627,7 @@ def _auto_tune_profile_with_openai(
     if not api_key:
         return {}, "OPENAI_API_KEY ausente"
     approved, result, criteria = _extract_summary_approval(summary_path)
-    profile = CONFIG.timeframe_profiles.get(tf)
+    profile = resolve_timeframe_profile(symbol, tf) or CONFIG.timeframe_profiles.get(tf)
     if approved is None or profile is None:
         return {}, "summary/perfil invalido"
     profile_payload = profile.model_dump()
@@ -623,6 +642,300 @@ def _auto_tune_profile_with_openai(
     )
     normalized = _normalize_profile_updates(tf, updates)
     return normalized, rationale
+
+
+def _auto_tune_profile_batch_with_openai(
+    *,
+    symbol: str,
+    tf: str,
+    summary_path: Path,
+    history: list[dict[str, Any]],
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    creds = _load_openai_credentials()
+    api_key = str(creds.get("OPENAI_API_KEY", "")).strip()
+    model = str(creds.get("OPENAI_MODEL", "gpt-4.1-mini")).strip() or "gpt-4.1-mini"
+    if not api_key:
+        return []
+    approved, result, criteria = _extract_summary_approval(summary_path)
+    profile = resolve_timeframe_profile(symbol, tf) or CONFIG.timeframe_profiles.get(tf)
+    if approved is None or profile is None:
+        return []
+    profile_payload = profile.model_dump()
+    raw_candidates = suggest_profile_update_candidates(
+        api_key=api_key,
+        model=model,
+        tf=tf,
+        profile=profile_payload,
+        result=result,
+        criteria=criteria,
+        history=history,
+        num_candidates=batch_size,
+    )
+    out: list[dict[str, Any]] = []
+    for item in raw_candidates:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_profile_updates(tf, dict(item.get("updates", {})))
+        if not normalized:
+            continue
+        out.append(
+            {
+                "updates": normalized,
+                "rationale": str(item.get("rationale", "")).strip() or "openai_batch",
+                "source": "openai",
+            }
+        )
+    return out
+
+
+def _batch_candidate_signature(updates: dict[str, Any]) -> str:
+    try:
+        return json.dumps(updates, sort_keys=True, ensure_ascii=True)
+    except Exception:
+        return str(sorted(updates.items()))
+
+
+def _build_heuristic_batch_candidates(symbol: str, tf: str, summary_path: Path, batch_size: int) -> list[dict[str, Any]]:
+    profile = resolve_timeframe_profile(symbol, tf) or CONFIG.timeframe_profiles.get(tf)
+    if profile is None:
+        return []
+    base_profile = profile.model_dump()
+    base_updates = _normalize_profile_updates(tf, _auto_tune_profile_from_summary(symbol=symbol, tf=tf, summary_path=summary_path))
+    candidate_pool: list[dict[str, Any]] = []
+    if base_updates:
+        candidate_pool.append(
+            {
+                "updates": base_updates,
+                "rationale": "heuristico_base",
+                "source": "heuristico",
+            }
+        )
+
+    threshold_deltas = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03]
+    margin_deltas = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03]
+    vol_specs = [(-10.0, +4.0), (-5.0, +3.0), (+5.0, -3.0), (+10.0, -5.0)]
+    freq_specs = [(-2, -1), (-1, -1), (+1, 0), (+2, 0)]
+    gate_modes = ["bias_only", "allow_wait", "strict", "off"]
+    impulse_specs = [
+        {"impulse_alignment_required": False},
+        {"impulse_alignment_required": True, "impulse_lookback_bars": 2, "impulse_min_abs_return": 0.00015},
+        {"impulse_alignment_required": True, "impulse_lookback_bars": 3, "impulse_min_abs_return": 0.00025},
+    ]
+
+    for td in threshold_deltas:
+        for md in margin_deltas:
+            candidate_pool.append(
+                {
+                    "updates": {
+                        "signal_threshold": float(base_profile.get("signal_threshold", 0.5)) + td,
+                        "min_signal_margin": float(base_profile.get("min_signal_margin", 0.05)) + md,
+                    },
+                    "rationale": f"heuristico_thr_margin_{td:+.2f}_{md:+.2f}",
+                    "source": "heuristico",
+                }
+            )
+            if len(candidate_pool) >= batch_size * 3:
+                break
+        if len(candidate_pool) >= batch_size * 3:
+            break
+
+    for dv_min, dv_max in vol_specs:
+        candidate_pool.append(
+            {
+                "updates": {
+                    "volatility_p_min": float(base_profile.get("volatility_p_min", 40.0)) + dv_min,
+                    "volatility_p_max": float(base_profile.get("volatility_p_max", 95.0)) + dv_max,
+                },
+                "rationale": f"heuristico_vol_{dv_min:+.0f}_{dv_max:+.0f}",
+                "source": "heuristico",
+            }
+        )
+
+    for d_freq, d_reentry in freq_specs:
+        candidate_pool.append(
+            {
+                "updates": {
+                    "max_trades_per_hour": int(base_profile.get("max_trades_per_hour", 2)) + d_freq,
+                    "reentry_block_candles": int(base_profile.get("reentry_block_candles", 2)) + d_reentry,
+                    "min_candles_between_same_direction_trades": int(base_profile.get("min_candles_between_same_direction_trades", 2)) + d_reentry,
+                },
+                "rationale": f"heuristico_freq_{d_freq:+d}_{d_reentry:+d}",
+                "source": "heuristico",
+            }
+        )
+
+    for gate_mode in gate_modes:
+        candidate_pool.append(
+            {
+                "updates": {"gate_mode": gate_mode},
+                "rationale": f"heuristico_gate_{gate_mode}",
+                "source": "heuristico",
+            }
+        )
+
+    for impulse in impulse_specs:
+        candidate_pool.append(
+            {
+                "updates": impulse,
+                "rationale": f"heuristico_impulse_{'on' if impulse.get('impulse_alignment_required') else 'off'}",
+                "source": "heuristico",
+            }
+        )
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in candidate_pool:
+        updates = _normalize_profile_updates(tf, item.get("updates", {}))
+        if not updates:
+            continue
+        sig = _batch_candidate_signature(updates)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append({"updates": updates, "rationale": item.get("rationale", ""), "source": item.get("source", "heuristico")})
+        if len(out) >= batch_size:
+            break
+    return out
+
+
+def _build_batch_candidates(
+    *,
+    symbol: str,
+    tf: str,
+    summary_path: Path,
+    history: list[dict[str, Any]],
+    batch_size: int,
+    use_openai: bool,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if use_openai:
+        try:
+            for item in _auto_tune_profile_batch_with_openai(
+                symbol=symbol,
+                tf=tf,
+                summary_path=summary_path,
+                history=history,
+                batch_size=batch_size,
+            ):
+                sig = _batch_candidate_signature(item.get("updates", {}))
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                candidates.append(item)
+        except Exception as exc:
+            _print(f"OpenAI falhou ao gerar lote: {exc}", style="yellow")
+    if len(candidates) < batch_size:
+        fallback = _build_heuristic_batch_candidates(symbol=symbol, tf=tf, summary_path=summary_path, batch_size=max(batch_size * 2, 8))
+        for item in fallback:
+            sig = _batch_candidate_signature(item.get("updates", {}))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            candidates.append(item)
+            if len(candidates) >= batch_size:
+                break
+    return candidates[:batch_size]
+
+
+def _copy_summary_snapshot(summary_path: Path, target_dir: Path, label: str) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    ext = summary_path.suffix or ".json"
+    dst = target_dir / f"{summary_path.stem}_{label}{ext}"
+    shutil.copy2(summary_path, dst)
+    return dst
+
+
+def _criteria_pass_count(result: dict[str, Any], criteria: dict[str, Any]) -> int:
+    count = 0
+    if float(result.get("pf_gt_1_ratio_valid_only", 0.0)) >= float(criteria.get("pf_gt_1_ratio_valid_only_min", 0.60)):
+        count += 1
+    if bool(result.get("dd_windows_ok", False)):
+        count += 1
+    if float(result.get("stress25_pf", 0.0)) > float(criteria.get("stress25_pf_min", 1.0)):
+        count += 1
+    if int(result.get("trade_windows_count", 0)) >= int(criteria.get("trade_windows_count_min", 6)):
+        count += 1
+    if float(result.get("coverage_ratio", 0.0)) >= float(criteria.get("coverage_ratio_min", 0.90)):
+        count += 1
+    if int(result.get("trades_total", 0)) >= int(criteria.get("trades_total_min", 120)):
+        count += 1
+    return count
+
+
+def _candidate_rank_payload(summary_path: Path) -> dict[str, Any]:
+    approved, result, criteria = _extract_summary_approval(summary_path)
+    approved_flag = bool(approved) if approved is not None else False
+    pf_ratio = float(result.get("pf_gt_1_ratio_valid_only", 0.0)) if isinstance(result, dict) else 0.0
+    stress = float(result.get("stress25_pf", 0.0)) if isinstance(result, dict) else 0.0
+    coverage = float(result.get("coverage_ratio", 0.0)) if isinstance(result, dict) else 0.0
+    trades_total = int(result.get("trades_total", 0)) if isinstance(result, dict) else 0
+    trade_windows = int(result.get("trade_windows_count", 0)) if isinstance(result, dict) else 0
+    no_signal = int(result.get("no_signal_windows", 0)) if isinstance(result, dict) else 0
+    dd_ok = bool(result.get("dd_windows_ok", False)) if isinstance(result, dict) else False
+    pass_count = _criteria_pass_count(result if isinstance(result, dict) else {}, criteria if isinstance(criteria, dict) else {})
+    rank = (
+        1 if approved_flag else 0,
+        pass_count,
+        1 if dd_ok else 0,
+        round(stress, 6),
+        round(pf_ratio, 6),
+        round(coverage, 6),
+        trade_windows,
+        trades_total,
+        -no_signal,
+    )
+    return {
+        "approved": approved_flag,
+        "result": result if isinstance(result, dict) else {},
+        "criteria": criteria if isinstance(criteria, dict) else {},
+        "pass_count": pass_count,
+        "rank": rank,
+        "summary_path": summary_path,
+    }
+
+
+def _print_batch_result_table(batch_results: list[dict[str, Any]], top_n: int = 10) -> None:
+    if not batch_results:
+        return
+    ordered = sorted(batch_results, key=lambda item: item.get("rank", ()), reverse=True)[:top_n]
+    if Table is not None and _CONSOLE is not None:
+        tb = Table(title="Ranking do lote", show_lines=False)
+        tb.add_column("#", style="cyan")
+        tb.add_column("Status", style="white")
+        tb.add_column("Pass", style="magenta")
+        tb.add_column("PF", style="white")
+        tb.add_column("Stress", style="white")
+        tb.add_column("Trades", style="white")
+        tb.add_column("Origem", style="white")
+        tb.add_column("Racional", style="green")
+        for i, item in enumerate(ordered, start=1):
+            result = item.get("result", {})
+            tb.add_row(
+                str(i),
+                "APROVADO" if item.get("approved") else "quase",
+                str(item.get("pass_count", 0)),
+                f"{float(result.get('pf_gt_1_ratio_valid_only', 0.0)):.3f}",
+                f"{float(result.get('stress25_pf', 0.0)):.3f}",
+                str(int(result.get("trades_total", 0))),
+                str(item.get("source", "-")),
+                str(item.get("rationale", "-"))[:50],
+            )
+        _CONSOLE.print(tb)
+    else:
+        _print("Ranking do lote:", style="cyan")
+        for i, item in enumerate(ordered, start=1):
+            result = item.get("result", {})
+            _print(
+                f"{i}. {'APROVADO' if item.get('approved') else 'quase'} "
+                f"| pass={item.get('pass_count', 0)} "
+                f"| pf={float(result.get('pf_gt_1_ratio_valid_only', 0.0)):.3f} "
+                f"| stress={float(result.get('stress25_pf', 0.0)):.3f} "
+                f"| trades={int(result.get('trades_total', 0))} "
+                f"| {str(item.get('rationale', '-'))[:50]}",
+                style="white",
+            )
 
 
 def _print_last_selection(last: dict[str, Any]) -> None:
@@ -1304,23 +1617,23 @@ def _active_intraday_preset(tf: str) -> dict[str, Any]:
             "enabled": True,
             "tf_entry": "M1",
             "tf_gate": "M5",
-            "gate_mode": "allow_wait",
-            "gate_min_margin_block": 0.14,
-            "horizon_candles": 10,
+            "gate_mode": "bias_only",
+            "gate_min_margin_block": 0.22,
+            "horizon_candles": 8,
             "max_trades_per_hour": 12,
             "trades_window_mode": "rolling_60m",
-            "min_candles_between_same_direction_trades": 1,
-            "reentry_block_candles": 1,
-            "volatility_p_min": 20.0,
-            "volatility_p_max": 98.0,
+            "min_candles_between_same_direction_trades": 0,
+            "reentry_block_candles": 0,
+            "volatility_p_min": 10.0,
+            "volatility_p_max": 99.0,
             "risk_pct": 0.20,
-            "signal_threshold": 0.50,
-            "min_signal_margin": 0.03,
-            "allow_gate_wait_bypass": True,
-            "gate_wait_bypass_threshold": 0.68,
-            "impulse_alignment_required": True,
+            "signal_threshold": 0.48,
+            "min_signal_margin": 0.01,
+            "allow_gate_wait_bypass": False,
+            "gate_wait_bypass_threshold": 0.60,
+            "impulse_alignment_required": False,
             "impulse_lookback_bars": 3,
-            "impulse_min_abs_return": 0.00003,
+            "impulse_min_abs_return": 0.0,
         }
     return {
         "enabled": True,
@@ -1856,6 +2169,8 @@ def _action_post_train_flow() -> None:
         if approved is False:
             if _ask_yes_no("Aplicar auto-ajuste IA no perfil agora?", default=True):
                 use_openai = _ask_yes_no("Usar OpenAI API para sugerir parametros?", default=True)
+                batch_size = int(_ask("Qtd de candidatos por rodada (1-50)", "5"))
+                batch_size = max(1, min(batch_size, 50))
                 continuous_mode = _ask_yes_no(
                     "Modo continuo ate APROVAR? (para apenas com Q ou quando aprovar)",
                     default=True,
@@ -1866,8 +2181,10 @@ def _action_post_train_flow() -> None:
                 if max_iters > 0:
                     max_iters = min(max_iters, 200)
                 history: list[dict[str, Any]] = []
-                current_summary = summary_path
+                current_summary = _copy_summary_snapshot(summary_path, run_dir / "outputs", "baseline")
                 reached_target = False
+                current_best = _candidate_rank_payload(current_summary)
+                current_override_payload = _get_tf_override_payload(tf)
 
                 if _ask_yes_no("Reexecutar robustez automaticamente agora?", default=True):
                     if msvcrt is not None:
@@ -1882,76 +2199,127 @@ def _action_post_train_flow() -> None:
                             if str(ch).lower() == "q":
                                 _print("Auto-ajuste interrompido pelo usuario (Q).", style="yellow")
                                 break
-                        if use_openai:
-                            try:
-                                updates, rationale = _auto_tune_profile_with_openai(
-                                    tf=tf,
-                                    summary_path=current_summary,
-                                    history=history,
-                                )
-                            except Exception as exc:
-                                _print(f"OpenAI falhou na iteracao {i}: {exc}", style="yellow")
-                                updates, rationale = {}, "fallback_heuristico"
-                        else:
-                            updates, rationale = {}, "heuristico"
-
-                        if not updates:
-                            updates = _normalize_profile_updates(tf, _auto_tune_profile_from_summary(tf=tf, summary_path=current_summary))
-                            if not updates:
-                                _print("Nao foi possivel gerar ajustes nesta iteracao.", style="yellow")
-                                break
-                            if rationale == "fallback_heuristico":
-                                rationale = "fallback_heuristico_sem_sugestao_openai"
-
-                        _save_tf_override(
-                            tf=tf,
-                            updates=updates,
-                            reason=f"auto_tune_iter_{i}:{rationale}",
-                        )
                         iter_label = f"{i}/{max_iters}" if max_iters > 0 else f"{i}/INF"
-                        _print(f"[Iteracao {iter_label}] Auto-ajuste aplicado:", style="green")
-                        for k, v in updates.items():
-                            _print(f"- {k} = {v}", style="cyan")
+                        batch_candidates = _build_batch_candidates(
+                            symbol=symbol,
+                            tf=tf,
+                            summary_path=current_summary,
+                            history=history,
+                            batch_size=batch_size,
+                            use_openai=use_openai,
+                        )
+                        if not batch_candidates:
+                            _print("Nao foi possivel gerar candidatos nesta rodada.", style="yellow")
+                            break
 
-                        rerun_id = _run_id(symbol, tf, f"{run_tag}_retune{i}")
-                        rerun_dir = RUNS_DIR / rerun_id
-                        meta2 = _run_module(
-                            module=module,
-                            args=args,
-                            run_dir=rerun_dir,
-                            allow_quit_with_q=True,
+                        _print(f"[Iteracao {iter_label}] Avaliando lote com {len(batch_candidates)} candidatos...", style="green")
+                        batch_results: list[dict[str, Any]] = []
+                        baseline_rank = dict(current_best)
+                        baseline_rank["label"] = "baseline"
+                        baseline_rank["source"] = "baseline"
+                        baseline_rank["rationale"] = "perfil_atual"
+                        batch_results.append(baseline_rank)
+
+                        stop_requested = False
+                        for idx, candidate in enumerate(batch_candidates, start=1):
+                            if msvcrt is not None and msvcrt.kbhit():
+                                ch = msvcrt.getwch()
+                                if str(ch).lower() == "q":
+                                    _print("Auto-ajuste interrompido pelo usuario (Q).", style="yellow")
+                                    stop_requested = True
+                                    break
+                            candidate_updates = dict(candidate.get("updates", {}))
+                            candidate_rationale = str(candidate.get("rationale", "")).strip() or "lote"
+                            applied_payload = {**current_override_payload, **candidate_updates}
+                            _replace_tf_override(
+                                tf=tf,
+                                payload=applied_payload,
+                                reason=f"auto_tune_batch_iter_{i}_cand_{idx}:{candidate_rationale}",
+                            )
+                            _print(f"  Candidato {idx}/{len(batch_candidates)} | origem={candidate.get('source', '-')}", style="cyan")
+                            for k, v in candidate_updates.items():
+                                _print(f"    - {k} = {v}", style="cyan")
+
+                            rerun_id = _run_id(symbol, tf, f"{run_tag}_retune{i}_c{idx}")
+                            rerun_dir = RUNS_DIR / rerun_id
+                            meta2 = _run_module(
+                                module=module,
+                                args=args,
+                                run_dir=rerun_dir,
+                                allow_quit_with_q=True,
+                            )
+                            if bool(meta2.get("cancelled_by_user", False)):
+                                _print("Reexecucao interrompida pelo usuario (Q).", style="yellow")
+                                stop_requested = True
+                                break
+                            _print(
+                                f"  Resultado candidato {idx} | return_code={meta2['return_code']}",
+                                style=("green" if meta2["return_code"] == 0 else "red"),
+                            )
+                            _print_run_result(rerun_dir, meta2)
+                            summary2 = _find_summary_path(meta2, default_summary)
+                            if summary2 is None and default_summary.endswith("_"):
+                                cands2 = sorted(CONFIG.reports_dir.glob(f"{default_summary}*.json"))
+                                if cands2:
+                                    summary2 = cands2[-1]
+                            if summary2 is None:
+                                continue
+                            snapshot2 = _copy_summary_snapshot(summary2, rerun_dir / "outputs", f"iter{i}_cand{idx}")
+                            rank_payload = _candidate_rank_payload(snapshot2)
+                            rank_payload.update(
+                                {
+                                    "updates": candidate_updates,
+                                    "applied_payload": applied_payload,
+                                    "rationale": candidate_rationale,
+                                    "source": str(candidate.get("source", "-")),
+                                    "run_dir": rerun_dir,
+                                }
+                            )
+                            batch_results.append(rank_payload)
+                            result2 = rank_payload.get("result", {})
+                            history.append(
+                                {
+                                    "iteration": i,
+                                    "candidate": idx,
+                                    "updates": candidate_updates,
+                                    "approved": rank_payload.get("approved", False),
+                                    "pf_ratio": float(result2.get("pf_gt_1_ratio_valid_only", 0.0)),
+                                    "stress25_pf": float(result2.get("stress25_pf", 0.0)),
+                                    "trades_total": int(result2.get("trades_total", 0)),
+                                }
+                            )
+                        _replace_tf_override(
+                            tf=tf,
+                            payload=current_override_payload,
+                            reason=f"restore_before_selection_iter_{i}",
                         )
-                        if bool(meta2.get("cancelled_by_user", False)):
-                            _print("Reexecucao interrompida pelo usuario (Q).", style="yellow")
+                        if stop_requested:
                             break
-                        _print(
-                            f"Reexecucao concluida | return_code={meta2['return_code']}",
-                            style=("green" if meta2["return_code"] == 0 else "red"),
-                        )
-                        _print_run_result(rerun_dir, meta2)
-                        summary2 = _find_summary_path(meta2, default_summary)
-                        if summary2 is None and default_summary.endswith("_"):
-                            cands2 = sorted(CONFIG.reports_dir.glob(f"{default_summary}*.json"))
-                            if cands2:
-                                summary2 = cands2[-1]
-                        if summary2 is None:
-                            _print("Summary nao encontrado apos reexecucao.", style="yellow")
-                            break
-                        current_summary = summary2
-                        _print_phase_summary(current_summary)
-                        approved2, result2, criteria2 = _extract_summary_approval(current_summary)
-                        history.append(
-                            {
-                                "iteration": i,
-                                "updates": updates,
-                                "approved": approved2,
-                                "pf_ratio": float(result2.get("pf_gt_1_ratio_valid_only", 0.0)) if isinstance(result2, dict) else 0.0,
-                            }
-                        )
+
+                        _print_batch_result_table(batch_results)
+                        ordered_results = sorted(batch_results, key=lambda item: item.get("rank", ()), reverse=True)
+                        best_candidate = ordered_results[0]
+                        current_best = best_candidate
+                        if best_candidate.get("source") == "baseline":
+                            _print("Nenhum candidato superou o perfil atual nesta rodada.", style="yellow")
+                            current_summary = Path(str(best_candidate.get("summary_path")))
+                        else:
+                            current_override_payload = dict(best_candidate.get("applied_payload", current_override_payload))
+                            _replace_tf_override(
+                                tf=tf,
+                                payload=current_override_payload,
+                                reason=f"selected_batch_best_iter_{i}:{best_candidate.get('rationale', '')}",
+                            )
+                            current_summary = Path(str(best_candidate.get("summary_path")))
+                            _print("Melhor candidato da rodada selecionado como perfil ativo.", style="green")
+                            _print_phase_summary(current_summary)
+
+                        approved2 = bool(best_candidate.get("approved", False))
+                        result2 = best_candidate.get("result", {})
+                        criteria2 = best_candidate.get("criteria", {})
                         pf_ratio = float(result2.get("pf_gt_1_ratio_valid_only", 0.0)) if isinstance(result2, dict) else 0.0
                         pf_min = float(criteria2.get("pf_gt_1_ratio_valid_only_min", 0.6)) if isinstance(criteria2, dict) else 0.6
-                        approved_flag = bool(approved2) if approved2 is not None else False
-                        if approved_flag:
+                        if approved2:
                             reached_target = True
                             _print(
                                 f"Meta atingida: APROVADO | pf_ratio={pf_ratio:.3f} (min={pf_min:.3f}). Encerrando loop.",
@@ -1959,7 +2327,7 @@ def _action_post_train_flow() -> None:
                             )
                             break
                         _print(
-                            f"Ainda reprovado: approved={approved_flag} | pf_ratio={pf_ratio:.3f} (min={pf_min:.3f}). Seguindo para proxima iteracao.",
+                            f"Melhor do lote ainda reprovado | pf_ratio={pf_ratio:.3f} (min={pf_min:.3f}) | pass={best_candidate.get('pass_count', 0)}.",
                             style="yellow",
                         )
                         if not continuous_mode and max_iters == 0:
@@ -1967,7 +2335,7 @@ def _action_post_train_flow() -> None:
                             break
                     _print(f"Override salvo em: {TF_OVERRIDES_FILE}", style="magenta")
                     if not reached_target:
-                        _print("Meta de pf_ratio nao foi atingida dentro do limite de iteracoes.", style="yellow")
+                        _print("Nenhum lote atingiu aprovacao dentro do limite configurado.", style="yellow")
     else:
         _print("Resumo da robustez nao encontrado.", style="yellow")
     if meta["return_code"] != 0:
