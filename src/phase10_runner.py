@@ -11,7 +11,7 @@ import pandas as pd
 from sklearn.utils.class_weight import compute_class_weight
 
 from .backtest_engine import DROP_COLS, evaluate_external_signals
-from .config import CONFIG, TimeframeConfig
+from .config import CONFIG, TimeframeConfig, resolve_session_settings, resolve_timeframe_profile
 from .data_feed import run_collection
 from .features import process_features
 from .labeling_triple_barrier import build_dataset, triple_barrier_labels
@@ -148,20 +148,122 @@ def _direction_policy(entry_signal: int, gate_signal: int) -> tuple[int, str]:
     return entry_signal, "ok"
 
 
+def _impulse_value(row: pd.Series, lookback_bars: int) -> float:
+    if lookback_bars in {1, 3, 12}:
+        return float(row.get(f"log_return_{lookback_bars}", 0.0) or 0.0)
+    return float(row.get("log_return_3", 0.0) or 0.0)
+
+
+def _gate_policy(
+    entry_signal: int,
+    gate_signal: int,
+    gate_buy_prob: float,
+    gate_sell_prob: float,
+    profile: TimeframeConfig,
+) -> tuple[int, str]:
+    mode = str(profile.gate_mode or "strict").lower().strip()
+    gate_margin = abs(float(gate_buy_prob) - float(gate_sell_prob))
+    if entry_signal == WAIT:
+        return WAIT, "entry_wait"
+    if mode == "off":
+        return entry_signal, "ok"
+    if mode == "allow_wait":
+        if gate_signal == WAIT:
+            return entry_signal, "ok"
+        if gate_signal != entry_signal:
+            return WAIT, "blocked_by_tf_conflict"
+        return entry_signal, "ok"
+    if mode == "bias_only":
+        if gate_signal == WAIT:
+            return entry_signal, "ok"
+        if gate_signal != entry_signal and gate_margin >= float(profile.gate_min_margin_block):
+            return WAIT, "blocked_by_tf_conflict"
+        return entry_signal, "ok"
+    return _direction_policy(entry_signal, gate_signal)
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    hh, mm = value.strip().split(":")
+    return int(hh), int(mm)
+
+
+def _is_in_session(ts: pd.Timestamp, windows: tuple[str, ...]) -> bool:
+    if not windows:
+        return True
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    current = ts.hour * 60 + ts.minute
+    for win in windows:
+        if "-" not in win:
+            continue
+        start_s, end_s = win.split("-", 1)
+        sh, sm = _parse_hhmm(start_s)
+        eh, em = _parse_hhmm(end_s)
+        start_m = sh * 60 + sm
+        end_m = eh * 60 + em
+        if start_m <= end_m:
+            if start_m <= current <= end_m:
+                return True
+        else:
+            if current >= start_m or current <= end_m:
+                return True
+    return False
+
+
+def _resolve_profile_thresholds(
+    profile: TimeframeConfig,
+    regime_class: str,
+) -> dict[str, float]:
+    thr = float(profile.signal_threshold)
+    margin = float(profile.min_signal_margin)
+    buy_thr = float(profile.buy_signal_threshold if profile.buy_signal_threshold is not None else thr)
+    sell_thr = float(profile.sell_signal_threshold if profile.sell_signal_threshold is not None else thr)
+    buy_margin = float(profile.buy_min_signal_margin if profile.buy_min_signal_margin is not None else margin)
+    sell_margin = float(profile.sell_min_signal_margin if profile.sell_min_signal_margin is not None else margin)
+    dyn = profile.regime_thresholds.get(str(regime_class or "RANGING").upper(), {})
+    if isinstance(dyn, dict):
+        if "signal_threshold" in dyn:
+            thr = float(dyn["signal_threshold"])
+        if "min_signal_margin" in dyn:
+            margin = float(dyn["min_signal_margin"])
+        if "buy_signal_threshold" in dyn:
+            buy_thr = float(dyn["buy_signal_threshold"])
+        if "sell_signal_threshold" in dyn:
+            sell_thr = float(dyn["sell_signal_threshold"])
+        if "buy_min_signal_margin" in dyn:
+            buy_margin = float(dyn["buy_min_signal_margin"])
+        if "sell_min_signal_margin" in dyn:
+            sell_margin = float(dyn["sell_min_signal_margin"])
+    return {
+        "signal_threshold": thr,
+        "min_signal_margin": margin,
+        "buy_signal_threshold": max(buy_thr, thr),
+        "sell_signal_threshold": max(sell_thr, thr),
+        "buy_min_signal_margin": max(buy_margin, margin),
+        "sell_min_signal_margin": max(sell_margin, margin),
+    }
+
+
 def _apply_phase10_controls(
     df: pd.DataFrame,
     profile: TimeframeConfig,
     threshold: float,
     min_signal_margin: float,
+    use_session_filter: bool = False,
+    allowed_sessions: tuple[str, ...] = (),
 ) -> tuple[np.ndarray, list[str], dict[str, float]]:
     out = df.copy()
     entry_signal = np.zeros(len(out), dtype=int)
     for i in range(len(out)):
         p_buy = float(out.iloc[i]["prob_h1_buy"])
         p_sell = float(out.iloc[i]["prob_h1_sell"])
-        if p_buy >= threshold and p_buy > p_sell:
+        regime_class = str(out.iloc[i].get("regime_class", "RANGING"))
+        thr_meta = _resolve_profile_thresholds(profile, regime_class)
+        buy_thr = max(float(thr_meta["buy_signal_threshold"]), float(threshold))
+        sell_thr = max(float(thr_meta["sell_signal_threshold"]), float(threshold))
+        if p_buy >= buy_thr and p_buy > p_sell:
             entry_signal[i] = BUY
-        elif p_sell >= threshold and p_sell > p_buy:
+        elif p_sell >= sell_thr and p_sell > p_buy:
             entry_signal[i] = SELL
     gate_signal = out["signal_h4_aligned"].fillna(WAIT).astype(int).values
 
@@ -178,12 +280,34 @@ def _apply_phase10_controls(
 
     for i in range(len(out) - 1):
         t = pd.Timestamp(out.iloc[i]["time"])
-        d, reason = _direction_policy(entry_signal[i], int(gate_signal[i]))
+        d, reason = _gate_policy(
+            entry_signal=entry_signal[i],
+            gate_signal=int(gate_signal[i]),
+            gate_buy_prob=float(out.iloc[i].get("prob_h4_buy_aligned", 0.0) or 0.0),
+            gate_sell_prob=float(out.iloc[i].get("prob_h4_sell_aligned", 0.0) or 0.0),
+            profile=profile,
+        )
+        if d != WAIT and use_session_filter and not _is_in_session(t, allowed_sessions):
+            d, reason = WAIT, "SESSION_FILTER"
         if d != WAIT:
             p_buy = float(out.iloc[i]["prob_h1_buy"])
             p_sell = float(out.iloc[i]["prob_h1_sell"])
-            if abs(p_buy - p_sell) < min_signal_margin:
+            regime_class = str(out.iloc[i].get("regime_class", "RANGING"))
+            thr_meta = _resolve_profile_thresholds(profile, regime_class)
+            dir_margin = (
+                float(thr_meta["buy_min_signal_margin"]) if d == BUY else float(thr_meta["sell_min_signal_margin"])
+            )
+            effective_margin = max(float(min_signal_margin), dir_margin)
+            if abs(p_buy - p_sell) < effective_margin:
                 d, reason = WAIT, "blocked_by_low_signal_margin"
+
+        if d != WAIT and profile.impulse_alignment_required:
+            impulse = _impulse_value(out.iloc[i], int(profile.impulse_lookback_bars))
+            impulse_min = float(profile.impulse_min_abs_return)
+            if d == BUY and impulse < impulse_min:
+                d, reason = WAIT, "blocked_by_impulse_alignment"
+            elif d == SELL and impulse > -impulse_min:
+                d, reason = WAIT, "blocked_by_impulse_alignment"
 
         if d != WAIT:
             atr_v = float(atr[i])
@@ -267,7 +391,7 @@ def run_phase10(
     output_prefix: str = "phase10",
 ) -> Path:
     CONFIG.ensure_dirs()
-    profile = CONFIG.timeframe_profiles.get(entry_tf)
+    profile = resolve_timeframe_profile(symbol=symbol, timeframe=entry_tf)
     if not profile or not profile.enabled:
         raise RuntimeError(f"Timeframe profile disabled/not found for {entry_tf}")
     if profile.tf_gate != gate_tf:
@@ -281,6 +405,7 @@ def run_phase10(
     gate_ds["time"] = pd.to_datetime(gate_ds["time"], utc=True)
 
     bounds = _window_bounds(entry_ds, windows=windows, min_train_rows=120)
+    use_session_filter, allowed_sessions = resolve_session_settings(symbol=symbol, timeframe=entry_tf)
     threshold = float(profile.signal_threshold if threshold is None else threshold)
     min_signal_margin = float(profile.min_signal_margin if min_signal_margin is None else min_signal_margin)
     preds_dir = CONFIG.reports_dir / "preds_phase10"
@@ -304,7 +429,8 @@ def run_phase10(
         p_gate.to_csv(p2, index=False)
 
         test = entry_ds[(entry_ds["time"] >= start) & (entry_ds["time"] <= end)].copy()
-        test = test[["time", "y", "spread", "ATR_14"]].merge(
+        base_cols = [c for c in ["time", "y", "spread", "ATR_14", "regime_class"] if c in test.columns]
+        test = test[base_cols].merge(
             p_entry.rename(
                 columns={"signal": "signal_h1", "prob_buy": "prob_h1_buy", "prob_sell": "prob_h1_sell", "has_pred": "has_h1_pred"}
             ),
@@ -327,6 +453,8 @@ def run_phase10(
             profile=profile,
             threshold=threshold,
             min_signal_margin=min_signal_margin,
+            use_session_filter=use_session_filter,
+            allowed_sessions=allowed_sessions,
         )
 
         rep, det = evaluate_external_signals(
@@ -374,6 +502,8 @@ def run_phase10(
                 "threshold_used": threshold,
                 "min_signal_margin": min_signal_margin,
                 "blocked_reason_counts": json.dumps(blocked_counts, separators=(",", ":")),
+                "use_session_filter": bool(use_session_filter),
+                "allowed_sessions_utc": json.dumps(list(allowed_sessions), separators=(",", ":")),
                 "preds_entry_path": str(p1),
                 "preds_gate_path": str(p2),
             }
@@ -394,6 +524,7 @@ def run_phase10(
             {
                 "window": w,
                 "params": {"entry_tf": entry_tf, "gate_tf": gate_tf, "threshold": threshold},
+                "session_filter": {"enabled": use_session_filter, "allowed_sessions_utc": list(allowed_sessions)},
                 "report": rep,
                 "stress25": rep_s,
                 "blocked_reason_counts": blocked_counts,

@@ -8,7 +8,8 @@ import pandas as pd
 
 from .config import CONFIG
 from .fracdiff import fracdiff
-from .regimes import adx, classify_regimes, detect_vol_regime
+from .fundamentals import add_fundamental_features
+from .regimes import adx, bollinger_bandwidth, classify_regimes, detect_vol_regime, hurst_exponent_series
 
 
 def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
@@ -32,12 +33,14 @@ def rsi(close: pd.Series, window: int = 14) -> pd.Series:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, dxy_strength: float = 0.0) -> pd.DataFrame:
     out = df.copy()
     out["log_return_1"] = np.log(out["close"]).diff(1)
     out["log_return_3"] = np.log(out["close"]).diff(3)
     out["log_return_12"] = np.log(out["close"]).diff(12)
     out["ATR_14"] = atr(out, CONFIG.feature.atr_window)
+    out["ATR_50"] = atr(out, 50)
+    out["atr_ratio_14_50"] = out["ATR_14"] / out["ATR_50"].replace(0.0, np.nan)
 
     out["body"] = (out["close"] - out["open"]) / out["ATR_14"]
     out["range"] = (out["high"] - out["low"]) / out["ATR_14"]
@@ -54,6 +57,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["dist_ema21"] = (out["close"] - out["EMA_21"]) / out["ATR_14"]
     out["dist_ema50"] = (out["close"] - out["EMA_50"]) / out["ATR_14"]
     out["RSI_14"] = rsi(out["close"], CONFIG.feature.rsi_window)
+    out["bb_bandwidth_20"] = bollinger_bandwidth(out["close"], window=20, n_std=2.0)
+    out["hurst_100"] = hurst_exponent_series(out["close"], window=100)
     out["rolling_vol_20"] = np.log(out["close"]).diff().rolling(20).std()
     out["resistance_20"] = out["high"].rolling(20).max()
     out["support_20"] = out["low"].rolling(20).min()
@@ -72,6 +77,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         d=CONFIG.feature.fracdiff_d,
         thresh=CONFIG.fracdiff_threshold,
     )
+    out["dxy_strength"] = float(dxy_strength)
+    out = add_fundamental_features(out, time_col="time")
     out = classify_regimes(out)
     out = out.dropna().reset_index(drop=True)
     return out

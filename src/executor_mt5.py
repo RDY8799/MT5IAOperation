@@ -122,3 +122,39 @@ def close_position(
         }
     )
     return ok, response
+
+
+def modify_position_sltp(
+    symbol: str,
+    ticket: int,
+    sl: float | None,
+    tp: float | None,
+) -> tuple[bool, Any]:
+    if mt5 is None:
+        raise RuntimeError("MetaTrader5 package not installed.")
+    if not ensure_logged_in():
+        _json_log({"event": "modify_fail", "reason": "mt5_login_failed", "ticket": ticket})
+        return False, None
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": symbol,
+        "position": int(ticket),
+        "sl": float(sl or 0.0),
+        "tp": float(tp or 0.0),
+        "magic": CONFIG.live.magic_number,
+        "comment": "mt5_ai_bot_manage_exit",
+    }
+    response = mt5.order_send(request)
+    ok = response is not None and getattr(response, "retcode", None) == mt5.TRADE_RETCODE_DONE
+    _json_log(
+        {
+            "event": "position_modify_sltp",
+            "symbol": symbol,
+            "ticket": int(ticket),
+            "request": request,
+            "response": response._asdict() if response else None,
+            "ok": ok,
+        }
+    )
+    return ok, response

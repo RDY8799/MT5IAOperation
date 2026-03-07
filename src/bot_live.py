@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -15,9 +16,10 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from .config import CONFIG, TimeframeConfig
-from .executor_mt5 import close_position, send_order
+from .config import CONFIG, TimeframeConfig, resolve_exit_settings, resolve_session_settings, resolve_timeframe_profile
+from .executor_mt5 import close_position, modify_position_sltp, send_order
 from .features import build_features
+from .fundamentals import fetch_dxy_strength, get_fundamental_window_status
 from .global_risk import GlobalRiskCoordinator
 from .multitf import BUY, SELL, WAIT, align_h4_to_h1, apply_policy
 from .mt5_connect import ensure_logged_in, shutdown
@@ -57,6 +59,28 @@ _CONSOLE = Console() if Console else None
 _GLOBAL_COORD = GlobalRiskCoordinator()
 
 
+@dataclass
+class LiveProtectionState:
+    realized_pnl: float = 0.0
+    realized_peak_pnl: float = 0.0
+    consecutive_losses: int = 0
+    cooldown_until: datetime | None = None
+    same_side_block_until: dict[str, datetime | None] = field(
+        default_factory=lambda: {"BUY": None, "SELL": None}
+    )
+
+
+@dataclass
+class ManagedPositionState:
+    ticket: int
+    side: str
+    entry_price: float
+    initial_sl: float
+    initial_tp: float
+    break_even_done: bool = False
+    trailing_active: bool = False
+
+
 def _fmt_local_ts() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
 
@@ -83,6 +107,7 @@ def _pretty_line(payload: dict) -> str:
         "position_closed_detected": "POSICAO_FECHADA",
         "time_stop_close": "TIME_STOP",
         "health_monitor": "SAUDE_MODELO",
+        "strong_signal_blocked": "SINAL_FORTE_BLOQUEADO",
         "telegram_notify_failed": "FALHA_TELEGRAM",
     }.get(str(event), str(event).upper())
     decision_pt = {
@@ -94,12 +119,18 @@ def _pretty_line(payload: dict) -> str:
         "OK": "OK",
         "COOLDOWN": "EM_COOLDOWN",
         "MAX_OPEN_POSITIONS": "MAX_POSICOES_ABERTAS",
+        "MAX_SYMBOL_POSITIONS_LIVE": "MAX_POSICOES_POR_ATIVO",
         "MAX_TRADES_PER_DAY": "MAX_TRADES_DIA",
         "MAX_DAILY_LOSS_PCT": "MAX_PERDA_DIA",
         "MIN_MARGIN_LEVEL_PCT": "MARGEM_BAIXA",
         "SESSION_FILTER": "FORA_DA_SESSAO",
         "NEWS_BLACKOUT": "JANELA_NOTICIA",
+        "FUNDAMENTAL_EVENT": "EVENTO_FUNDAMENTAL",
+        "LOSS_STREAK_COOLDOWN": "PAUSA_POR_PERDAS",
+        "SAME_SIDE_LOSS_PAUSE": "PAUSA_MESMA_DIRECAO",
+        "PROFIT_GIVEBACK_LOCK": "PAUSA_POR_DEVOLVER_LUCRO",
         "SPREAD_FILTER": "SPREAD_ALTO",
+        "blocked_by_impulse_alignment": "IMPULSO_FRACO",
     }.get(str(reason), str(reason) if reason else "")
 
     parts = [f"[{event_pt}]", f"{symbol}/{tf}"]
@@ -279,6 +310,66 @@ def _positions_count(symbol: str) -> int:
     return 0 if pos is None else len(pos)
 
 
+def _position_state_path(symbol: str, timeframe: str) -> Path:
+    safe_symbol = "".join(ch for ch in symbol.upper() if ch.isalnum() or ch in {"_", "-"})
+    safe_tf = "".join(ch for ch in timeframe.upper() if ch.isalnum() or ch in {"_", "-"})
+    return CONFIG.reports_dir / "runs" / f"live_position_state_{safe_symbol}_{safe_tf}.json"
+
+
+def _load_position_state(symbol: str, timeframe: str) -> dict[int, ManagedPositionState]:
+    path = _position_state_path(symbol, timeframe)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[int, ManagedPositionState] = {}
+    rows = data.get("positions", []) if isinstance(data, dict) else []
+    if not isinstance(rows, list):
+        return {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        try:
+            state = ManagedPositionState(
+                ticket=int(item["ticket"]),
+                side=str(item["side"]),
+                entry_price=float(item["entry_price"]),
+                initial_sl=float(item["initial_sl"]),
+                initial_tp=float(item.get("initial_tp", 0.0) or 0.0),
+                break_even_done=bool(item.get("break_even_done", False)),
+                trailing_active=bool(item.get("trailing_active", False)),
+            )
+        except Exception:
+            continue
+        out[state.ticket] = state
+    return out
+
+
+def _save_position_state(symbol: str, timeframe: str, state_map: dict[int, ManagedPositionState]) -> None:
+    path = _position_state_path(symbol, timeframe)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "positions": [
+            {
+                "ticket": s.ticket,
+                "side": s.side,
+                "entry_price": s.entry_price,
+                "initial_sl": s.initial_sl,
+                "initial_tp": s.initial_tp,
+                "break_even_done": s.break_even_done,
+                "trailing_active": s.trailing_active,
+            }
+            for s in sorted(state_map.values(), key=lambda x: x.ticket)
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def _normalize_lot(symbol: str, lot: float) -> float:
     cfg = CONFIG.risk
     if mt5 is None:
@@ -403,10 +494,115 @@ def _is_news_blackout(now_utc: datetime) -> bool:
     return False
 
 
-def _apply_time_stop(symbol: str, timeframe: str) -> int:
+def _resolve_dynamic_thresholds(
+    profile: TimeframeConfig | None,
+    regime_class: str,
+) -> dict[str, float]:
+    if profile is None:
+        base_thr = float(CONFIG.live.threshold)
+        return {
+            "signal_threshold": base_thr,
+            "min_signal_margin": 0.0,
+            "buy_signal_threshold": base_thr,
+            "sell_signal_threshold": base_thr,
+            "buy_min_signal_margin": 0.0,
+            "sell_min_signal_margin": 0.0,
+        }
+    thr = float(profile.signal_threshold)
+    margin = float(profile.min_signal_margin)
+    buy_thr = float(profile.buy_signal_threshold if profile.buy_signal_threshold is not None else thr)
+    sell_thr = float(profile.sell_signal_threshold if profile.sell_signal_threshold is not None else thr)
+    buy_margin = float(profile.buy_min_signal_margin if profile.buy_min_signal_margin is not None else margin)
+    sell_margin = float(profile.sell_min_signal_margin if profile.sell_min_signal_margin is not None else margin)
+    reg = str(regime_class or "RANGING").upper()
+    dyn = profile.regime_thresholds.get(reg, {}) if isinstance(profile.regime_thresholds, dict) else {}
+    if isinstance(dyn, dict):
+        if "signal_threshold" in dyn:
+            thr = float(dyn["signal_threshold"])
+        if "min_signal_margin" in dyn:
+            margin = float(dyn["min_signal_margin"])
+        if "buy_signal_threshold" in dyn:
+            buy_thr = float(dyn["buy_signal_threshold"])
+        if "sell_signal_threshold" in dyn:
+            sell_thr = float(dyn["sell_signal_threshold"])
+        if "buy_min_signal_margin" in dyn:
+            buy_margin = float(dyn["buy_min_signal_margin"])
+        if "sell_min_signal_margin" in dyn:
+            sell_margin = float(dyn["sell_min_signal_margin"])
+    buy_thr = max(buy_thr, thr)
+    sell_thr = max(sell_thr, thr)
+    buy_margin = max(buy_margin, margin)
+    sell_margin = max(sell_margin, margin)
+    return {
+        "signal_threshold": thr,
+        "min_signal_margin": margin,
+        "buy_signal_threshold": buy_thr,
+        "sell_signal_threshold": sell_thr,
+        "buy_min_signal_margin": buy_margin,
+        "sell_min_signal_margin": sell_margin,
+    }
+
+
+def _impulse_value(row: pd.Series, lookback_bars: int) -> float:
+    if lookback_bars in {1, 3, 12}:
+        return float(row.get(f"log_return_{lookback_bars}", 0.0) or 0.0)
+    return float(row.get("log_return_3", 0.0) or 0.0)
+
+
+def _gate_policy_live(
+    *,
+    entry_signal: str,
+    gate_signal: str,
+    gate_buy_prob: float,
+    gate_sell_prob: float,
+    confidence: float,
+    profile: TimeframeConfig | None,
+) -> tuple[str, str, str]:
+    if entry_signal == "WAIT":
+        return "WAIT", "entry_wait", ""
+    if profile is None:
+        if gate_signal != "WAIT" and gate_signal != entry_signal:
+            return "WAIT", "blocked_by_tf_conflict", f"entry=? {entry_signal} vs gate=? {gate_signal}"
+        return entry_signal, "OK", ""
+
+    mode = str(profile.gate_mode or "strict").lower().strip()
+    gate_margin = abs(float(gate_buy_prob) - float(gate_sell_prob))
+    if mode == "off":
+        return entry_signal, "OK", ""
+    if mode == "allow_wait":
+        if gate_signal == "WAIT":
+            can_bypass = bool(
+                profile.allow_gate_wait_bypass and confidence >= float(profile.gate_wait_bypass_threshold)
+            )
+            if can_bypass or not profile.allow_gate_wait_bypass:
+                return entry_signal, "OK", ""
+            return "WAIT", "blocked_by_tf_conflict", f"entry=? {entry_signal} vs gate=? WAIT"
+        if gate_signal != entry_signal:
+            return "WAIT", "blocked_by_tf_conflict", f"entry=? {entry_signal} vs gate=? {gate_signal}"
+        return entry_signal, "OK", ""
+    if mode == "bias_only":
+        if gate_signal == "WAIT":
+            return entry_signal, "OK", ""
+        if gate_signal != entry_signal and gate_margin >= float(profile.gate_min_margin_block):
+            return "WAIT", "blocked_by_tf_conflict", f"entry=? {entry_signal} vs gate=? {gate_signal}"
+        return entry_signal, "OK", ""
+
+    if gate_signal == "WAIT":
+        can_bypass_wait_gate = bool(
+            profile.allow_gate_wait_bypass and confidence >= float(profile.gate_wait_bypass_threshold)
+        )
+        if can_bypass_wait_gate:
+            return entry_signal, "OK", ""
+        return "WAIT", "blocked_by_tf_conflict", f"entry=? {entry_signal} vs gate=? WAIT"
+    if gate_signal != entry_signal:
+        return "WAIT", "blocked_by_tf_conflict", f"entry=? {entry_signal} vs gate=? {gate_signal}"
+    return entry_signal, "OK", ""
+
+
+def _apply_time_stop(symbol: str, timeframe: str, max_holding_override: int | None = None) -> int:
     if mt5 is None:
         return 0
-    max_candles = int(CONFIG.live.max_holding_candles)
+    max_candles = int(CONFIG.live.max_holding_candles if max_holding_override is None else max_holding_override)
     if max_candles <= 0:
         return 0
     tf_min = timeframe_minutes(timeframe)
@@ -473,40 +669,121 @@ def _current_positions_map(symbol: str) -> dict[int, dict]:
             "side": side,
             "volume": float(getattr(p, "volume", 0.0) or 0.0),
             "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
+            "sl": float(getattr(p, "sl", 0.0) or 0.0),
+            "tp": float(getattr(p, "tp", 0.0) or 0.0),
+            "price_current": float(getattr(p, "price_current", 0.0) or 0.0),
             "time": float(getattr(p, "time", 0.0) or 0.0),
             "profit": float(getattr(p, "profit", 0.0) or 0.0),
         }
     return out
 
 
-def _closed_position_pnl(ticket: int) -> float | None:
+def _closed_position_pnl(symbol: str, ticket: int) -> float | None:
     if mt5 is None:
         return None
     try:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=7)
-        deals = mt5.history_deals_get(start, end, position=ticket)
+        deals = mt5.history_deals_get(start, end, group=symbol)
         if deals is None or len(deals) == 0:
             return None
         pnl = 0.0
         for d in deals:
+            position_id = getattr(d, "position_id", getattr(d, "position", None))
+            if int(position_id or -1) != int(ticket):
+                continue
+            entry_flag = int(getattr(d, "entry", -1) or -1)
+            if entry_flag not in {
+                getattr(mt5, "DEAL_ENTRY_OUT", 1),
+                getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
+                getattr(mt5, "DEAL_ENTRY_INOUT", 2),
+            }:
+                continue
             pnl += float(getattr(d, "profit", 0.0) or 0.0)
             pnl += float(getattr(d, "commission", 0.0) or 0.0)
             pnl += float(getattr(d, "swap", 0.0) or 0.0)
             pnl += float(getattr(d, "fee", 0.0) or 0.0)
+        if pnl == 0.0:
+            return None
         return pnl
     except Exception:
         return None
 
 
-def _notify_closed_positions(symbol: str, known_positions: dict[int, dict]) -> tuple[dict[int, dict], list[dict]]:
+def _candles_to_timedelta(candles: int, timeframe: str) -> timedelta:
+    return timedelta(minutes=max(1, candles) * max(1, timeframe_minutes(timeframe)))
+
+
+def _update_live_protection_after_close(
+    guard: LiveProtectionState,
+    *,
+    pnl: float | None,
+    side: str,
+    now_utc: datetime,
+    timeframe: str,
+) -> None:
+    if pnl is None:
+        return
+    guard.realized_pnl += float(pnl)
+    guard.realized_peak_pnl = max(guard.realized_peak_pnl, guard.realized_pnl)
+
+    if pnl < 0:
+        guard.consecutive_losses += 1
+        side_pause = _candles_to_timedelta(CONFIG.risk.same_side_loss_pause_candles, timeframe)
+        guard.same_side_block_until[side] = now_utc + side_pause
+        if guard.consecutive_losses >= int(CONFIG.risk.max_consecutive_losses):
+            streak_pause = _candles_to_timedelta(CONFIG.risk.loss_streak_cooldown_candles, timeframe)
+            guard.cooldown_until = now_utc + streak_pause
+            guard.consecutive_losses = 0
+    else:
+        guard.consecutive_losses = 0
+
+    peak = float(guard.realized_peak_pnl)
+    giveback_frac = float(CONFIG.risk.profit_giveback_lock_fraction)
+    if peak > 0.0 and guard.realized_pnl <= peak * (1.0 - giveback_frac):
+        giveback_pause = _candles_to_timedelta(CONFIG.risk.profit_giveback_cooldown_candles, timeframe)
+        if guard.cooldown_until is None or (now_utc + giveback_pause) > guard.cooldown_until:
+            guard.cooldown_until = now_utc + giveback_pause
+
+
+def _live_protection_block_reason(
+    guard: LiveProtectionState,
+    *,
+    now_utc: datetime,
+    decision: str,
+) -> str:
+    if guard.cooldown_until is not None and now_utc < guard.cooldown_until:
+        peak = float(guard.realized_peak_pnl)
+        if peak > 0.0 and guard.realized_pnl <= peak * (1.0 - float(CONFIG.risk.profit_giveback_lock_fraction)):
+            return "PROFIT_GIVEBACK_LOCK"
+        return "LOSS_STREAK_COOLDOWN"
+    if decision in {"BUY", "SELL"}:
+        side_until = guard.same_side_block_until.get(decision)
+        if side_until is not None and now_utc < side_until:
+            return "SAME_SIDE_LOSS_PAUSE"
+    return ""
+
+
+def _notify_closed_positions(
+    symbol: str,
+    timeframe: str,
+    known_positions: dict[int, dict],
+    guard: LiveProtectionState,
+) -> tuple[dict[int, dict], list[dict]]:
     current = _current_positions_map(symbol)
     closed_tickets = [t for t in known_positions.keys() if t not in current]
     closed_events: list[dict] = []
     for ticket in closed_tickets:
         prev = known_positions[ticket]
-        pnl = _closed_position_pnl(ticket)
+        pnl = _closed_position_pnl(symbol, ticket)
         _GLOBAL_COORD.unregister_closed_ticket(symbol, ticket)
+        _update_live_protection_after_close(
+            guard,
+            pnl=pnl,
+            side=str(prev.get("side", "WAIT")),
+            now_utc=datetime.now(timezone.utc),
+            timeframe=timeframe,
+        )
         closed_events.append({"ticket": int(ticket), "side": str(prev.get("side", "WAIT"))})
         _json_log(
             {
@@ -516,6 +793,10 @@ def _notify_closed_positions(symbol: str, known_positions: dict[int, dict]) -> t
                 "side": prev.get("side"),
                 "volume": prev.get("volume"),
                 "pnl": pnl,
+                "realized_pnl_session": guard.realized_pnl,
+                "realized_peak_pnl_session": guard.realized_peak_pnl,
+                "consecutive_losses": guard.consecutive_losses,
+                "cooldown_until": guard.cooldown_until.isoformat() if guard.cooldown_until else "",
             }
         )
         pnl_txt = f"{pnl:.2f}" if pnl is not None else "n/a"
@@ -533,13 +814,133 @@ def _notify_closed_positions(symbol: str, known_positions: dict[int, dict]) -> t
     return current, closed_events
 
 
-def _decision_from_proba(proba: np.ndarray, classes: list[int]) -> tuple[str, float, float]:
+def _sync_managed_positions(
+    symbol: str,
+    timeframe: str,
+    current_positions: dict[int, dict],
+    managed: dict[int, ManagedPositionState],
+) -> dict[int, ManagedPositionState]:
+    synced: dict[int, ManagedPositionState] = {}
+    for ticket, pos in current_positions.items():
+        state = managed.get(ticket)
+        if state is None:
+            state = ManagedPositionState(
+                ticket=int(ticket),
+                side=str(pos.get("side", "WAIT")),
+                entry_price=float(pos.get("price_open", 0.0) or 0.0),
+                initial_sl=float(pos.get("sl", 0.0) or 0.0),
+                initial_tp=float(pos.get("tp", 0.0) or 0.0),
+            )
+        synced[int(ticket)] = state
+    _save_position_state(symbol, timeframe, synced)
+    return synced
+
+
+def _manage_open_positions(
+    *,
+    symbol: str,
+    timeframe: str,
+    feats_entry: pd.DataFrame,
+    regime_class: str,
+    managed: dict[int, ManagedPositionState],
+) -> dict[int, ManagedPositionState]:
+    if mt5 is None:
+        return managed
+    current = _current_positions_map(symbol)
+    managed = _sync_managed_positions(symbol, timeframe, current, managed)
+    if not current:
+        return managed
+
+    exit_cfg = resolve_exit_settings(symbol=symbol, timeframe=timeframe)
+    atr = float(feats_entry.iloc[-1].get("ATR_14", 0.0) or 0.0)
+    high_vol_regimes = {"HIGH_VOL", "HIGH_VOL_BREAKOUT", "POST_NEWS_SHOCK"}
+    break_even_enabled = bool(exit_cfg.get("break_even_enabled", False))
+    break_even_r = float(exit_cfg.get("break_even_r", 0.5) or 0.5)
+    break_even_offset_r = float(exit_cfg.get("break_even_offset_r", 0.0) or 0.0)
+    trailing_enabled = bool(exit_cfg.get("trailing_enabled", False))
+    trailing_activation_r = float(exit_cfg.get("trailing_activation_r", 1.0) or 1.0)
+    trailing_atr_mult = float(exit_cfg.get("trailing_atr_mult", 1.0) or 1.0)
+    changed = False
+
+    for ticket, pos in current.items():
+        st = managed.get(ticket)
+        if st is None:
+            continue
+        initial_r = abs(float(st.entry_price) - float(st.initial_sl))
+        if initial_r <= 0:
+            continue
+        current_price = float(pos.get("price_current", 0.0) or 0.0)
+        current_sl = float(pos.get("sl", 0.0) or 0.0)
+        current_tp = float(pos.get("tp", 0.0) or 0.0)
+        if current_price <= 0:
+            continue
+
+        pnl_r = (
+            (current_price - st.entry_price) / initial_r
+            if st.side == "BUY"
+            else (st.entry_price - current_price) / initial_r
+        )
+        desired_sl = current_sl
+        action_reason = ""
+
+        if break_even_enabled and not st.break_even_done and pnl_r >= break_even_r:
+            offset = initial_r * break_even_offset_r
+            desired_sl = st.entry_price + offset if st.side == "BUY" else st.entry_price - offset
+            st.break_even_done = True
+            action_reason = "break_even"
+
+        if trailing_enabled and regime_class in high_vol_regimes and pnl_r >= trailing_activation_r and atr > 0:
+            trail_sl = current_price - (atr * trailing_atr_mult) if st.side == "BUY" else current_price + (atr * trailing_atr_mult)
+            if st.side == "BUY":
+                desired_sl = max(desired_sl, trail_sl)
+            else:
+                desired_sl = min(desired_sl if desired_sl > 0 else trail_sl, trail_sl)
+            st.trailing_active = True
+            action_reason = action_reason or "atr_trailing"
+
+        should_modify = False
+        if st.side == "BUY" and desired_sl > current_sl + 1e-8:
+            should_modify = True
+        if st.side == "SELL" and (current_sl <= 0 or desired_sl < current_sl - 1e-8):
+            should_modify = True
+
+        if should_modify:
+            ok, _ = modify_position_sltp(symbol=symbol, ticket=ticket, sl=desired_sl, tp=current_tp)
+            if ok:
+                changed = True
+                _json_log(
+                    {
+                        "event": "position_exit_adjust",
+                        "symbol": symbol,
+                        "tf": timeframe,
+                        "ticket": ticket,
+                        "reason": action_reason,
+                        "new_sl": desired_sl,
+                        "current_tp": current_tp,
+                        "pnl_r": pnl_r,
+                        "regime_class": regime_class,
+                    }
+                )
+    if changed:
+        _save_position_state(symbol, timeframe, managed)
+    return managed
+
+
+def _decision_from_proba(
+    proba: np.ndarray,
+    classes: list[int],
+    *,
+    buy_threshold: float | None = None,
+    sell_threshold: float | None = None,
+) -> tuple[str, float, float]:
     p_sell = float(proba[classes.index(0)]) if 0 in classes else 0.0
     p_buy = float(proba[classes.index(2)]) if 2 in classes else 0.0
+    buy_thr = float(CONFIG.live.threshold if buy_threshold is None else buy_threshold)
+    sell_thr = float(CONFIG.live.threshold if sell_threshold is None else sell_threshold)
     decision = "WAIT"
-    if p_buy >= CONFIG.live.threshold and p_buy > p_sell:
+    if p_buy >= buy_thr and p_buy > p_sell:
         decision = "BUY"
-    elif p_sell >= CONFIG.live.threshold and p_sell > p_buy:
+    elif p_sell >= sell_thr and p_sell > p_buy:
         decision = "SELL"
     return decision, p_buy, p_sell
 
@@ -560,11 +961,8 @@ def _int_to_decision(signal: int) -> str:
     return "WAIT"
 
 
-def _resolve_tf_profile(timeframe: str) -> TimeframeConfig | None:
-    profile = CONFIG.timeframe_profiles.get(timeframe)
-    if profile and profile.enabled:
-        return profile
-    return None
+def _resolve_tf_profile(symbol: str, timeframe: str) -> TimeframeConfig | None:
+    return resolve_timeframe_profile(symbol=symbol, timeframe=timeframe)
 
 
 def _window_trades_count(
@@ -680,9 +1078,11 @@ def run_live(
     if not ensure_logged_in():
         raise RuntimeError("MT5 login failed")
 
-    profile = _resolve_tf_profile(timeframe)
+    profile = _resolve_tf_profile(symbol, timeframe)
     tf_entry = timeframe
     tf_gate = profile.tf_gate if profile else timeframe
+    use_session_filter, allowed_sessions = resolve_session_settings(symbol=symbol, timeframe=tf_entry)
+    exit_cfg = resolve_exit_settings(symbol=symbol, timeframe=tf_entry)
     model_symbol = model_symbol or symbol
     model_tf = model_tf or tf_entry
     model_entry, model_entry_meta = _load_model_from_registry(
@@ -732,7 +1132,9 @@ def run_live(
     )
     failures = 0
     today_stats = TodayStats(trades_count=0, last_trade_time=None)
+    live_guard = LiveProtectionState()
     known_positions = _current_positions_map(symbol)
+    managed_positions = _load_position_state(symbol, tf_entry)
     health_buf = deque(maxlen=max(10, CONFIG.live.health_check_every_n_events))
     event_count = 0
     open_times: deque[datetime] = deque(maxlen=3000)
@@ -749,23 +1151,33 @@ def run_live(
         "blocked_by_missing_entry_pred_count": 0,
         "blocked_by_volatility_low_count": 0,
         "blocked_by_volatility_high_count": 0,
+        "blocked_by_impulse_alignment_count": 0,
         "blocked_by_frequency_count": 0,
         "blocked_by_global_risk_count": 0,
         "blocked_by_spread_count": 0,
         "blocked_by_session_count": 0,
         "blocked_by_news_blackout_count": 0,
+        "blocked_by_fundamental_count": 0,
+        "blocked_by_loss_streak_count": 0,
+        "blocked_by_profit_giveback_count": 0,
+        "blocked_by_same_side_loss_count": 0,
+        "blocked_by_symbol_positions_count": 0,
     }
 
     try:
         while True:
-            known_positions, closed_events = _notify_closed_positions(symbol, known_positions)
+            known_positions, closed_events = _notify_closed_positions(symbol, tf_entry, known_positions, live_guard)
             now_utc = datetime.now(timezone.utc)
             for ev in closed_events:
                 side = str(ev.get("side", "WAIT"))
                 if side in last_close_same_dir:
                     last_close_same_dir[side] = now_utc
 
-            _apply_time_stop(symbol=symbol, timeframe=tf_entry)
+            _apply_time_stop(
+                symbol=symbol,
+                timeframe=tf_entry,
+                max_holding_override=int(exit_cfg.get("max_holding_candles_override", 0) or 0),
+            )
             raw_entry = _fetch_recent(symbol=symbol, timeframe=tf_entry, bars=CONFIG.live.fetch_bars)
             if raw_entry.empty:
                 failures += 1
@@ -777,10 +1189,31 @@ def run_live(
                 continue
             failures = 0
 
-            feats_entry = build_features(raw_entry)
+            dxy_strength = 0.0
+            if CONFIG.live.use_dxy_proxy:
+                dxy_strength = fetch_dxy_strength(
+                    timeframe_mt5=TF_TO_MT5.get(tf_entry),
+                    bars=max(80, int(CONFIG.live.fetch_bars // 2)),
+                    symbols=CONFIG.live.dxy_symbols,
+                )
+            feats_entry = build_features(raw_entry, dxy_strength=dxy_strength)
             if feats_entry.empty:
                 time.sleep(3)
                 continue
+
+            regime_class = str(feats_entry.iloc[-1].get("regime_class", "RANGING"))
+            managed_positions = _manage_open_positions(
+                symbol=symbol,
+                timeframe=tf_entry,
+                feats_entry=feats_entry,
+                regime_class=regime_class,
+                managed=managed_positions,
+            )
+            entry_thresholds = _resolve_dynamic_thresholds(profile, regime_class=regime_class)
+            buy_threshold_used = float(entry_thresholds["buy_signal_threshold"])
+            sell_threshold_used = float(entry_thresholds["sell_signal_threshold"])
+            buy_min_signal_margin_used = float(entry_thresholds["buy_min_signal_margin"])
+            sell_min_signal_margin_used = float(entry_thresholds["sell_min_signal_margin"])
 
             entry_cols = _resolve_model_feature_cols(model_entry, feats_entry)
             schema_feats = model_entry_meta.get("schema_features", [])
@@ -804,17 +1237,20 @@ def run_live(
             entry_classes = model_entry.classes_.tolist()
             has_entry_pred = True
             reason_missing_entry_pred: str | None = None
-            p_sell = float(entry_proba[entry_classes.index(0)]) if 0 in entry_classes else 0.0
-            p_buy = float(entry_proba[entry_classes.index(2)]) if 2 in entry_classes else 0.0
-            threshold_used = float(profile.signal_threshold if profile else CONFIG.live.threshold)
-            min_signal_margin_used = float(profile.min_signal_margin if profile else 0.0)
+            entry_signal, p_buy, p_sell = _decision_from_proba(
+                entry_proba,
+                entry_classes,
+                buy_threshold=buy_threshold_used,
+                sell_threshold=sell_threshold_used,
+            )
             prob_diff = abs(p_buy - p_sell)
-            entry_signal = "WAIT"
-            if p_buy >= threshold_used and p_buy > p_sell:
-                entry_signal = "BUY"
-            elif p_sell >= threshold_used and p_sell > p_buy:
-                entry_signal = "SELL"
             confidence = max(p_buy, p_sell)
+            threshold_used = (
+                buy_threshold_used if entry_signal == "BUY" else sell_threshold_used if entry_signal == "SELL" else float(entry_thresholds["signal_threshold"])
+            )
+            min_signal_margin_used = (
+                buy_min_signal_margin_used if entry_signal == "BUY" else sell_min_signal_margin_used if entry_signal == "SELL" else float(entry_thresholds["min_signal_margin"])
+            )
 
             gate_signal = entry_signal
             gate_probs = {"buy": p_buy, "sell": p_sell}
@@ -822,20 +1258,29 @@ def run_live(
             reason_missing_gate_pred: str | None = None
             if model_gate is not None:
                 raw_gate = _fetch_recent(symbol=symbol, timeframe=tf_gate, bars=CONFIG.live.fetch_bars)
-                feats_gate = build_features(raw_gate) if not raw_gate.empty else pd.DataFrame()
+                gate_dxy_strength = dxy_strength if tf_gate == tf_entry else 0.0
+                if CONFIG.live.use_dxy_proxy and tf_gate != tf_entry:
+                    gate_dxy_strength = fetch_dxy_strength(
+                        timeframe_mt5=TF_TO_MT5.get(tf_gate),
+                        bars=max(80, int(CONFIG.live.fetch_bars // 2)),
+                        symbols=CONFIG.live.dxy_symbols,
+                    )
+                feats_gate = build_features(raw_gate, dxy_strength=gate_dxy_strength) if not raw_gate.empty else pd.DataFrame()
                 if not feats_gate.empty:
+                    gate_regime_class = str(feats_gate.iloc[-1].get("regime_class", "RANGING"))
+                    gate_profile = CONFIG.timeframe_profiles.get(tf_gate) or profile
+                    gate_thresholds = _resolve_dynamic_thresholds(gate_profile, regime_class=gate_regime_class)
                     gate_cols = _resolve_model_feature_cols(model_gate, feats_gate)
                     gate_idx = -2 if len(feats_gate) >= 2 else -1
                     row_gate = feats_gate.iloc[[gate_idx]][gate_cols]
                     gate_proba = model_gate.predict_proba(row_gate)[0]
                     gate_classes = model_gate.classes_.tolist()
-                    g_sell = float(gate_proba[gate_classes.index(0)]) if 0 in gate_classes else 0.0
-                    g_buy = float(gate_proba[gate_classes.index(2)]) if 2 in gate_classes else 0.0
-                    gate_signal = "WAIT"
-                    if g_buy >= threshold_used and g_buy > g_sell:
-                        gate_signal = "BUY"
-                    elif g_sell >= threshold_used and g_sell > g_buy:
-                        gate_signal = "SELL"
+                    gate_signal, g_buy, g_sell = _decision_from_proba(
+                        gate_proba,
+                        gate_classes,
+                        buy_threshold=float(gate_thresholds["buy_signal_threshold"]),
+                        sell_threshold=float(gate_thresholds["sell_signal_threshold"]),
+                    )
                     gate_probs = {"buy": g_buy, "sell": g_sell}
                 else:
                     gate_signal = "WAIT"
@@ -844,12 +1289,19 @@ def run_live(
                     reason_missing_gate_pred = "missing_gate_features"
             gate_prob_diff = abs(float(gate_probs["buy"]) - float(gate_probs["sell"]))
 
-            regime_class = str(feats_entry.iloc[-1].get("regime_class", "NEUTRAL"))
             spread_points = float(feats_entry.iloc[-1].get("spread", 0.0) or 0.0)
+            high_impact_next_60 = bool(int(feats_entry.iloc[-1].get("high_impact_in_next_60min", 0) or 0))
+            hours_since_high_impact = float(feats_entry.iloc[-1].get("hours_since_last_high_impact", 1e9) or 1e9)
             atr_val, atr_p_min_val, atr_p_max_val, atr_rank = (
                 _atr_threshold_values(feats_entry, profile)
                 if profile
                 else (float(feats_entry.iloc[-1].get("ATR_14", 0.0) or 0.0), 0.0, 1e9, 0.0)
+            )
+            fund_status = get_fundamental_window_status(
+                now_utc,
+                pre_minutes=CONFIG.live.news_blackout_minutes_pre,
+                post_minutes=CONFIG.live.news_blackout_minutes_post,
+                next_window_minutes=CONFIG.fundamentals.next_event_window_minutes,
             )
 
             final_decision = entry_signal
@@ -872,22 +1324,47 @@ def run_live(
                     final_decision = "WAIT"
                     block_reason = "blocked_by_missing_gate_pred"
                     conflict_detail = f"entry={tf_entry} {entry_signal} vs gate={tf_gate} WAIT"
-                if not block_reason and model_gate is not None and gate_signal != final_decision:
-                    final_decision = "WAIT"
-                    block_reason = "blocked_by_tf_conflict"
-                    conflict_detail = f"entry={tf_entry} {entry_signal} vs gate={tf_gate} {gate_signal}"
-                if not block_reason and CONFIG.live.use_session_filter and not _is_in_session(now_utc, CONFIG.live.allowed_sessions_utc):
+                if not block_reason and model_gate is not None:
+                    gate_decision, gate_reason, gate_conflict = _gate_policy_live(
+                        entry_signal=entry_signal,
+                        gate_signal=gate_signal,
+                        gate_buy_prob=float(gate_probs["buy"]),
+                        gate_sell_prob=float(gate_probs["sell"]),
+                        confidence=confidence,
+                        profile=profile,
+                    )
+                    final_decision = gate_decision
+                    if gate_reason not in {"", "OK"}:
+                        block_reason = gate_reason
+                    if gate_conflict:
+                        conflict_detail = gate_conflict.replace("entry=?", f"entry={tf_entry}").replace(
+                            "gate=?", f"gate={tf_gate}"
+                        )
+                if not block_reason and use_session_filter and not _is_in_session(now_utc, allowed_sessions):
                     final_decision = "WAIT"
                     block_reason = "SESSION_FILTER"
                 if not block_reason and _is_news_blackout(now_utc):
                     final_decision = "WAIT"
                     block_reason = "NEWS_BLACKOUT"
+                if not block_reason and CONFIG.live.use_fundamental_calendar and fund_status.blocked:
+                    final_decision = "WAIT"
+                    block_reason = "FUNDAMENTAL_EVENT"
                 if not block_reason and spread_points > CONFIG.live.max_spread_points:
                     final_decision = "WAIT"
                     block_reason = "SPREAD_FILTER"
-                if not block_reason and profile and prob_diff < float(profile.min_signal_margin):
+                if not block_reason and prob_diff < float(min_signal_margin_used):
                     final_decision = "WAIT"
                     block_reason = "blocked_by_low_signal_margin"
+
+                if not block_reason and profile and profile.impulse_alignment_required:
+                    impulse_val = _impulse_value(feats_entry.iloc[-1], int(profile.impulse_lookback_bars))
+                    impulse_min = float(profile.impulse_min_abs_return)
+                    if final_decision == "BUY" and impulse_val < impulse_min:
+                        final_decision = "WAIT"
+                        block_reason = "blocked_by_impulse_alignment"
+                    elif final_decision == "SELL" and impulse_val > -impulse_min:
+                        final_decision = "WAIT"
+                        block_reason = "blocked_by_impulse_alignment"
 
                 if not block_reason and profile:
                     if atr_val < atr_p_min_val:
@@ -910,6 +1387,20 @@ def run_live(
                     if not block_reason and candles_since_close < int(profile.reentry_block_candles):
                         final_decision = "WAIT"
                         block_reason = "blocked_by_reentry_rule"
+
+                if not block_reason and _positions_count(symbol) >= int(CONFIG.risk.max_symbol_positions_live):
+                    final_decision = "WAIT"
+                    block_reason = "MAX_SYMBOL_POSITIONS_LIVE"
+
+                if not block_reason:
+                    guard_reason = _live_protection_block_reason(
+                        live_guard,
+                        now_utc=now_utc,
+                        decision=entry_signal,
+                    )
+                    if guard_reason:
+                        final_decision = "WAIT"
+                        block_reason = guard_reason
 
                 if not block_reason:
                     can_open, reason = can_open_trade(state, _positions_count(symbol), today_stats)
@@ -940,8 +1431,13 @@ def run_live(
                 )
                 regime_mult_map = {
                     "TREND": CONFIG.risk.regime_mult_trend,
+                    "TRENDING_STRONG": CONFIG.risk.regime_mult_trend,
                     "HIGH_VOL": CONFIG.risk.regime_mult_high_vol,
+                    "HIGH_VOL_BREAKOUT": CONFIG.risk.regime_mult_high_vol,
+                    "POST_NEWS_SHOCK": CONFIG.risk.regime_mult_high_vol,
                     "SIDEWAYS": CONFIG.risk.regime_mult_sideways,
+                    "LOW_VOL_SIDEWAYS": CONFIG.risk.regime_mult_sideways,
+                    "RANGING": CONFIG.risk.regime_mult_neutral,
                     "NEUTRAL": CONFIG.risk.regime_mult_neutral,
                 }
                 regime_mult = float(regime_mult_map.get(regime_class, CONFIG.risk.regime_mult_neutral))
@@ -974,18 +1470,43 @@ def run_live(
                     last_open_same_dir[final_decision] = now_utc
                     if order_ticket > 0:
                         _GLOBAL_COORD.register_open_order(symbol, order_ticket, risk_pct_used)
+                        managed_positions[order_ticket] = ManagedPositionState(
+                            ticket=order_ticket,
+                            side=final_decision,
+                            entry_price=price,
+                            initial_sl=sl,
+                            initial_tp=tp,
+                        )
+                        _save_position_state(symbol, tf_entry, managed_positions)
                 elif no_trade or diagnostic_only:
                     block_reason = "OK"
                 else:
                     block_reason = "ORDER_FAIL"
 
             event_name = "decision" if final_decision != "WAIT" or entry_signal == "WAIT" else "decision_blocked"
+            strong_signal = max(p_buy, p_sell) >= (threshold_used + float(CONFIG.live.strong_signal_alert_delta))
+            if final_decision == "WAIT" and block_reason and strong_signal:
+                _json_log(
+                    {
+                        "event": "strong_signal_blocked",
+                        "symbol": symbol,
+                        "tf": tf_entry,
+                        "entry_signal": entry_signal,
+                        "gate_signal": gate_signal,
+                        "reason": block_reason,
+                        "p_buy": p_buy,
+                        "p_sell": p_sell,
+                        "threshold_used": threshold_used,
+                    }
+                )
+
             payload = {
                 "event": event_name,
                 "symbol": symbol,
                 "tf": tf_entry,
                 "tf_entry": tf_entry,
                 "tf_gate": tf_gate,
+                "gate_mode": str(profile.gate_mode if profile else "strict"),
                 "gate_signal": gate_signal,
                 "entry_signal": entry_signal,
                 "has_entry_pred": has_entry_pred,
@@ -1010,6 +1531,14 @@ def run_live(
                 "prob_diff": prob_diff,
                 "threshold_used": threshold_used,
                 "min_signal_margin_used": min_signal_margin_used,
+                "buy_threshold_used": buy_threshold_used,
+                "sell_threshold_used": sell_threshold_used,
+                "buy_min_signal_margin_used": buy_min_signal_margin_used,
+                "sell_min_signal_margin_used": sell_min_signal_margin_used,
+                "impulse_alignment_required": bool(profile.impulse_alignment_required) if profile else False,
+                "impulse_lookback_bars": int(profile.impulse_lookback_bars) if profile else 0,
+                "impulse_min_abs_return": float(profile.impulse_min_abs_return) if profile else 0.0,
+                "impulse_value": float(_impulse_value(feats_entry.iloc[-1], int(profile.impulse_lookback_bars))) if profile else 0.0,
                 "price": price,
                 "spread_points": spread_points,
                 "sl": sl if final_decision != "WAIT" else None,
@@ -1022,6 +1551,12 @@ def run_live(
                 "atr_p_min_value": atr_p_min_val,
                 "atr_p_max_value": atr_p_max_val,
                 "atr_percentile_current": atr_rank,
+                "dxy_strength": float(dxy_strength),
+                "high_impact_in_next_60min": high_impact_next_60,
+                "hours_since_last_high_impact": hours_since_high_impact,
+                "fundamental_blackout_active": bool(fund_status.blocked),
+                "next_high_impact_event_at": fund_status.next_event_at,
+                "next_high_impact_event_name": fund_status.next_event_name,
                 "risk_pct_used": risk_pct_used if final_decision != "WAIT" else 0.0,
                 "stop_distance_points": stop_distance_points,
                 "position_size_lots": lot,
@@ -1035,12 +1570,29 @@ def run_live(
                     today_stats.last_trade_time is not None
                     and (now_utc - today_stats.last_trade_time).total_seconds() < (CONFIG.risk.cooldown_minutes * 60)
                 ),
+                "loss_streak_cooldown_active": bool(live_guard.cooldown_until is not None and now_utc < live_guard.cooldown_until),
+                "consecutive_losses": int(live_guard.consecutive_losses),
+                "realized_pnl_session": float(live_guard.realized_pnl),
+                "realized_peak_pnl_session": float(live_guard.realized_peak_pnl),
+                "same_side_block_until_buy": live_guard.same_side_block_until["BUY"].isoformat() if live_guard.same_side_block_until["BUY"] else "",
+                "same_side_block_until_sell": live_guard.same_side_block_until["SELL"].isoformat() if live_guard.same_side_block_until["SELL"] else "",
                 "max_trades_window_count": int(trades_in_window),
                 "volatility_state": (
                     "LOW" if atr_val < atr_p_min_val else ("HIGH" if atr_val > atr_p_max_val else "OK")
                 ),
+                "use_session_filter": bool(use_session_filter),
+                "allowed_sessions_utc": list(allowed_sessions),
+                "gate_policy": str(profile.gate_mode if profile else "strict"),
+                "break_even_enabled": bool(exit_cfg.get("break_even_enabled", False)),
+                "break_even_r": float(exit_cfg.get("break_even_r", 0.5) or 0.5),
+                "trailing_enabled": bool(exit_cfg.get("trailing_enabled", False)),
+                "trailing_activation_r": float(exit_cfg.get("trailing_activation_r", 1.0) or 1.0),
+                "impulse_alignment_required": bool(profile.impulse_alignment_required) if profile else False,
+                "impulse_lookback_bars": int(profile.impulse_lookback_bars) if profile else 0,
+                "impulse_min_abs_return": float(profile.impulse_min_abs_return) if profile else 0.0,
+                "impulse_value": float(_impulse_value(feats_entry.iloc[-1], int(profile.impulse_lookback_bars))) if profile else 0.0,
                 "decision_panel": {
-                    "threshold": CONFIG.live.threshold,
+                    "threshold": threshold_used,
                     "p_buy": p_buy,
                     "p_sell": p_sell,
                     "confidence": confidence,
@@ -1073,6 +1625,8 @@ def run_live(
                 diag_counter["blocked_by_volatility_low_count"] += 1
             if block_reason == "blocked_by_volatility_high":
                 diag_counter["blocked_by_volatility_high_count"] += 1
+            if block_reason == "blocked_by_impulse_alignment":
+                diag_counter["blocked_by_impulse_alignment_count"] += 1
             if block_reason == "blocked_by_frequency":
                 diag_counter["blocked_by_frequency_count"] += 1
             if block_reason.startswith("blocked_by_global_"):
@@ -1083,6 +1637,16 @@ def run_live(
                 diag_counter["blocked_by_session_count"] += 1
             if block_reason == "NEWS_BLACKOUT":
                 diag_counter["blocked_by_news_blackout_count"] += 1
+            if block_reason == "FUNDAMENTAL_EVENT":
+                diag_counter["blocked_by_fundamental_count"] += 1
+            if block_reason == "LOSS_STREAK_COOLDOWN":
+                diag_counter["blocked_by_loss_streak_count"] += 1
+            if block_reason == "PROFIT_GIVEBACK_LOCK":
+                diag_counter["blocked_by_profit_giveback_count"] += 1
+            if block_reason == "SAME_SIDE_LOSS_PAUSE":
+                diag_counter["blocked_by_same_side_loss_count"] += 1
+            if block_reason == "MAX_SYMBOL_POSITIONS_LIVE":
+                diag_counter["blocked_by_symbol_positions_count"] += 1
 
             if (now_utc - last_diag_dump).total_seconds() >= 3600:
                 hour_key = now_utc.strftime("%Y-%m-%d_%H")
@@ -1144,7 +1708,7 @@ def run_live(
                 )
 
             if once:
-                known_positions, _ = _notify_closed_positions(symbol, known_positions)
+                known_positions, _ = _notify_closed_positions(symbol, tf_entry, known_positions, live_guard)
                 break
             sleep_s = wait_seconds_to_next_candle(feats_entry.iloc[-1]["time"], tf_entry)
             _sleep_with_countdown(max(1.0, sleep_s), symbol=symbol, timeframe=tf_entry)

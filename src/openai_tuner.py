@@ -32,6 +32,10 @@ def suggest_profile_updates(
     allowed_keys = [
         "signal_threshold",
         "min_signal_margin",
+        "buy_signal_threshold",
+        "sell_signal_threshold",
+        "buy_min_signal_margin",
+        "sell_min_signal_margin",
         "volatility_p_min",
         "volatility_p_max",
         "reentry_block_candles",
@@ -56,6 +60,10 @@ def suggest_profile_updates(
             "updates": {
                 "signal_threshold": "float",
                 "min_signal_margin": "float",
+                "buy_signal_threshold": "float",
+                "sell_signal_threshold": "float",
+                "buy_min_signal_margin": "float",
+                "sell_min_signal_margin": "float",
                 "volatility_p_min": "float",
                 "volatility_p_max": "float",
                 "reentry_block_candles": "int",

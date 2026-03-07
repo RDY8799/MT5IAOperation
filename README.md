@@ -6,6 +6,7 @@ Bot de trading com IA para MetaTrader 5, com pipeline de dados, treino LightGBM,
 
 - Coleta candles com fonte hibrida (`auto`: MT5 -> Yahoo fallback).
 - Gera features tecnicas e labels (triple barrier).
+- Adiciona features fundamentais (calendario high-impact + distancia temporal de evento).
 - Treina LightGBM com validacao temporal (PurgedKFold).
 - Roda fases de robustez (`phase4` ate `phase11`).
 - Executa bot live/paper/diagnostico.
@@ -17,6 +18,7 @@ Bot de trading com IA para MetaTrader 5, com pipeline de dados, treino LightGBM,
 ```
 mt5_ai_bot/
   data/
+    calendar_2025_2026.csv      # calendario economico high-impact (UTC)
     raw/
     processed/
   logs/
@@ -83,6 +85,95 @@ Opcional, para usar auto-ajuste iterativo no fluxo pos-treino:
   - `OPENAI_API_KEY`
   - `OPENAI_MODEL` (padrao sugerido: `gpt-4.1-mini`)
 
+## Perfis por simbolo / timeframe
+
+O bot agora aceita perfil especifico por ativo e timeframe em:
+
+- `reports/runs/symbol_profiles.json`
+
+Campos suportados por perfil:
+
+- `gate`: timeframe superior usado como direcao/gate
+- `profile_updates.gate_mode`: `strict` | `allow_wait` | `bias_only` | `off`
+- `profile_updates.gate_min_margin_block`: margem minima do gate para bloquear no modo `bias_only`
+- `use_session_filter`: ativa filtro por janela horaria UTC
+- `allowed_sessions_utc`: lista como `["06:00-17:00"]`
+- `break_even_enabled`, `break_even_r`
+- `trailing_enabled`, `trailing_activation_r`, `trailing_atr_mult`
+- `max_holding_candles_override`
+- `profile_updates.impulse_alignment_required`
+- `profile_updates.impulse_lookback_bars`
+- `profile_updates.impulse_min_abs_return`
+- `profile_updates`:
+  - `buy_signal_threshold`, `sell_signal_threshold`
+  - `buy_min_signal_margin`, `sell_min_signal_margin`
+
+Exemplo:
+
+```json
+{
+  "profiles": [
+    {
+      "symbol": "EURUSD",
+      "tf": "M5",
+      "gate": "M30",
+      "use_session_filter": false,
+      "break_even_enabled": true,
+      "break_even_r": 0.5,
+      "trailing_enabled": true,
+      "trailing_activation_r": 1.0,
+      "trailing_atr_mult": 1.0,
+      "max_holding_candles_override": 12,
+      "profile_updates": {
+        "buy_signal_threshold": 0.62,
+        "sell_signal_threshold": 0.58,
+        "buy_min_signal_margin": 0.22,
+        "sell_min_signal_margin": 0.16
+      }
+    }
+  ]
+}
+```
+
+Esses perfis podem ser configurados pelo menu na opcao `7`.
+
+## Modo intraday ativo
+
+O menu agora possui:
+
+- `16) Modo intraday ativo (M1/M5 preset + iniciar)`
+
+Objetivo:
+
+- operar com mais frequencia do que o perfil conservador
+- usar gate menos duro (`allow_wait` ou `bias_only`)
+- exigir impulso curto alinhado para evitar entradas totalmente aleatorias
+
+Presets atuais:
+
+- `M1 ativo`: gate `M5`, `gate_mode=allow_wait`, max `12` trades/hora
+- `M5 ativo`: gate `M15`, `gate_mode=bias_only`, max `4` trades/hora
+
+Observacao importante:
+
+- esse modo e um trilho mais agressivo e mais frequente
+- ele nao substitui automaticamente o setup conservador validado
+- para `EURUSD/M1`, e necessario ter modelos treinados `M1` e `M5`
+
+## Gestao ativa de saida no live
+
+No `bot_live`, posicoes abertas agora podem ter ajuste dinamico de saida:
+
+- break-even automatico ao atingir `break_even_r`
+- trailing por ATR em regime favoravel
+- time stop opcional por `max_holding_candles_override`
+- persistencia do estado em `reports/runs/position_state_{symbol}_{tf}.json`
+
+Quando houver modificacao real de SL/TP no MT5, o evento e logado como:
+
+- `position_modify_sltp`
+- `position_exit_adjust`
+
 ## Pipeline de treino (manual)
 
 ### 1) Coletar dados
@@ -105,6 +196,14 @@ Observacao:
 
 ```powershell
 python -m src.build_dataset --symbol EURUSD --tf M5
+
+Observacao:
+
+- O feature builder agora inclui:
+  - `high_impact_in_next_60min`
+  - `hours_since_last_high_impact`
+  - `atr_ratio_14_50`, `bb_bandwidth_20`, `hurst_100`
+  - `regime_class` mais detalhado (5 regimes)
 ```
 
 ### 3) Treinar modelo
@@ -178,6 +277,10 @@ MT5 AI BOT MENU
 │  ├─ salvar/atualizar OPENAI_API_KEY
 │  ├─ definir OPENAI_MODEL
 │  └─ limpar chave (digitar APAGAR)
+├─ 15) Modo scalping M1 (preset + iniciar)
+│  ├─ aplica preset M1 agressivo com controle de risco
+│  ├─ valida existencia de modelos M1 (entry) e M5 (gate)
+│  └─ inicia paper/demo em background
 └─ 0) Sair
 ```
 
@@ -236,6 +339,18 @@ MT5 AI BOT MENU
 - `2 -> Treinar novo modelo` (com `source=auto`)  
 - depois `4 -> Rodar bot (paper)`  
 - depois `5 -> Rodar bot (demo-trade)` se paper estiver consistente.
+
+## Teste rapido (demo, M5)
+
+```powershell
+python -m src.bot_live --symbol EURUSD --tf M5 --model-symbol EURUSD --model-tf M5 --use-latest-model
+```
+
+No log live, confira:
+
+- `FUNDAMENTAL_EVENT` quando houver blackout por evento high-impact.
+- `threshold_used` e `min_signal_margin_used` variando por `regime_class`.
+- `high_impact_in_next_60min`, `hours_since_last_high_impact` e `dxy_strength`.
 
 2. Diagnóstico de bloqueios:
 - `6 -> Rodar diagnostico`  
